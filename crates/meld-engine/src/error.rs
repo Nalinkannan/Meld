@@ -26,6 +26,10 @@ pub enum EngineError {
     Branch(String),
     #[error("drift error: {0}")]
     Drift(String),
+    #[error("diff error: {0}")]
+    Diff(String),
+    #[error("incompatible snapshot scope: {0}")]
+    IncompatibleScope(String),
     #[error("domain error: {0}")]
     Domain(#[from] MeldError),
     #[error("io error: {0}")]

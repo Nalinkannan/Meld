@@ -176,7 +176,8 @@ impl DatabaseAdapter for MongoAdapter {
         &self,
         plan: &meld_core::plan::RestorePlan,
     ) -> Result<ExecutionResult, MeldError> {
-        apply::execute(self.client()?, plan).await
+        let db_name = self.db_name()?;
+        apply::execute(self.client()?, db_name, plan).await
     }
 
     async fn health_check(&self) -> Result<(), MeldError> {

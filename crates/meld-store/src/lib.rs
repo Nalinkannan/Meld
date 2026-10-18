@@ -236,6 +236,11 @@ impl Store {
         integrity::integrity_check(&self.db)
     }
 
+    /// List all commit hashes in the repository.
+    pub fn list_all_commit_hashes(&self) -> Result<Vec<CommitHash>, MeldError> {
+        commit_store::list_all_commit_hashes(&self.db)
+    }
+
     /// Record when this store was last touched (for diagnostics).
     pub fn touched_at(&self) -> chrono::DateTime<Utc> {
         Utc::now()

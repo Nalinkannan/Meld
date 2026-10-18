@@ -82,7 +82,10 @@ pub async fn introspect(
     Ok(meld_core::state::EngineState::MongoDb(state))
 }
 
-async fn get_collection_options(db: &Database, name: &str) -> Result<CollectionOptions, MeldError> {
+pub async fn get_collection_options(
+    db: &Database,
+    name: &str,
+) -> Result<CollectionOptions, MeldError> {
     let doc = db
         .run_command(
             bson::doc! {"listCollections": 1, "filter": bson::doc! {"name": name}},
@@ -124,7 +127,7 @@ async fn get_collection_options(db: &Database, name: &str) -> Result<CollectionO
     })
 }
 
-async fn get_validator(db: &Database, name: &str) -> Result<Option<Validator>, MeldError> {
+pub async fn get_validator(db: &Database, name: &str) -> Result<Option<Validator>, MeldError> {
     let doc = db
         .run_command(
             bson::doc! {"listCollections": 1, "filter": bson::doc! {"name": name}},
@@ -170,7 +173,7 @@ async fn get_validator(db: &Database, name: &str) -> Result<Option<Validator>, M
     }))
 }
 
-async fn get_indexes(
+pub async fn get_indexes(
     coll: &mongodb::Collection<mongodb::bson::Document>,
 ) -> Result<IndexMap<String, MongoIndex>, MeldError> {
     let mut cursor = coll
@@ -264,7 +267,7 @@ async fn extract_documents(
     Ok(docs)
 }
 
-fn bson_value_to_canonical(v: &mongodb::bson::Bson) -> CanonicalValue {
+pub fn bson_value_to_canonical(v: &mongodb::bson::Bson) -> CanonicalValue {
     match v {
         mongodb::bson::Bson::Null => CanonicalValue::Null,
         mongodb::bson::Bson::Boolean(b) => CanonicalValue::Boolean(*b),

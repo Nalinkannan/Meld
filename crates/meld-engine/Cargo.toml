@@ -20,3 +20,5 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+futures = "0.3"
+indexmap = { workspace = true }

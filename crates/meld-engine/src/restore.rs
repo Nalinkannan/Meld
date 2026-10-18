@@ -7,7 +7,10 @@
 
 use meld_adapter::DatabaseAdapter;
 use meld_core::plan::{OperationRisk, PlanOp, PlanOpKind, RestorePlan};
-use meld_core::state::{EngineKind, EngineState, PgRowIdentity, PgTable, PostgresState};
+use meld_core::state::{
+    CanonicalValue, EngineKind, EngineState, MongoCollectionState, MongoDocument, MongoState,
+    PgRowIdentity, PgTable, PostgresState,
+};
 use serde_json;
 
 use crate::error::EngineError;
@@ -30,16 +33,20 @@ pub async fn build_restore_plan(
         (EngineState::PostgreSql(target_state), EngineState::PostgreSql(live_state)) => {
             build_postgres_plan(adapter, target_state, live_state).await?
         }
+        (EngineState::MongoDb(target_state), EngineState::MongoDb(live_state)) => {
+            build_mongodb_plan(target_state, live_state).await?
+        }
         (EngineState::PostgreSql(_), EngineState::MongoDb(_)) => {
             return Err(EngineError::IncompatibleEngine {
                 expected: EngineKind::PostgreSql,
                 got: EngineKind::MongoDb,
             });
         }
-        (EngineState::MongoDb(_), _) => {
-            return Err(EngineError::Unsupported(
-                "MongoDB restore planning not yet implemented".into(),
-            ));
+        (EngineState::MongoDb(_), EngineState::PostgreSql(_)) => {
+            return Err(EngineError::IncompatibleEngine {
+                expected: EngineKind::MongoDb,
+                got: EngineKind::PostgreSql,
+            });
         }
     };
 
@@ -241,6 +248,245 @@ fn diff_rows(
     Ok(ops)
 }
 
+// ---------------------------------------------------------------------------
+// MongoDB restore plan building
+// ---------------------------------------------------------------------------
+
+/// Build a MongoDB restore plan by diffing the target state against the
+/// live state, collection by collection.
+async fn build_mongodb_plan(
+    target: &MongoState,
+    live: &MongoState,
+) -> Result<Vec<PlanOp>, EngineError> {
+    let mut ops: Vec<PlanOp> = Vec::new();
+
+    // Collections in target but not in live -> create
+    for (coll_name, target_coll) in &target.collections {
+        match live.collections.get(coll_name) {
+            None => {
+                ops.push(collection_op(
+                    next_op_id(),
+                    PlanOpKind::CreateCollection,
+                    coll_name,
+                    OperationRisk::Reversible,
+                    format!("create collection {coll_name}"),
+                    Some(
+                        serde_json::to_string(target_coll)
+                            .map_err(|e| EngineError::Internal(e.to_string()))?,
+                    ),
+                ));
+            }
+            Some(live_coll) => {
+                ops.extend(diff_collection(coll_name, target_coll, live_coll)?);
+            }
+        }
+    }
+
+    // Collections in live but not in target -> drop
+    for coll_name in live.collections.keys() {
+        if !target.collections.contains_key(coll_name) {
+            ops.push(collection_op(
+                next_op_id(),
+                PlanOpKind::DropCollection,
+                coll_name,
+                OperationRisk::Destructive,
+                format!("drop collection {coll_name}"),
+                None,
+            ));
+        }
+    }
+
+    Ok(ops)
+}
+
+/// Build plan ops diffing one collection (options, validator, indexes, documents).
+fn diff_collection(
+    coll_name: &str,
+    target: &MongoCollectionState,
+    live: &MongoCollectionState,
+) -> Result<Vec<PlanOp>, EngineError> {
+    let mut ops: Vec<PlanOp> = Vec::new();
+
+    // Collection options (capped, size, max, TTL).
+    if target.options != live.options {
+        ops.push(collection_op(
+            next_op_id(),
+            PlanOpKind::AlterCollection,
+            coll_name,
+            OperationRisk::Reversible,
+            format!("alter collection options {coll_name}"),
+            Some(serde_json::to_string(target).map_err(|e| EngineError::Internal(e.to_string()))?),
+        ));
+    }
+
+    // Validator.
+    match (&target.validator, &live.validator) {
+        (Some(tval), None) => {
+            ops.push(validator_op(
+                next_op_id(),
+                coll_name,
+                OperationRisk::Reversible,
+                format!("add validator {coll_name}"),
+                Some(
+                    serde_json::to_string(tval)
+                        .map_err(|e| EngineError::Internal(e.to_string()))?,
+                ),
+            ));
+        }
+        (Some(tval), Some(lval)) if tval != lval => {
+            ops.push(validator_op(
+                next_op_id(),
+                coll_name,
+                OperationRisk::Reversible,
+                format!("change validator {coll_name}"),
+                Some(
+                    serde_json::to_string(tval)
+                        .map_err(|e| EngineError::Internal(e.to_string()))?,
+                ),
+            ));
+        }
+        (None, Some(_)) => {
+            ops.push(validator_op(
+                next_op_id(),
+                coll_name,
+                OperationRisk::Destructive,
+                format!("remove validator {coll_name}"),
+                None,
+            ));
+        }
+        _ => {}
+    }
+
+    // Indexes.
+    for (idx_name, target_idx) in &target.indexes {
+        if idx_name == "_id_" {
+            continue; // implicit index, never managed
+        }
+        match live.indexes.get(idx_name) {
+            None => {
+                ops.push(index_op(
+                    next_op_id(),
+                    PlanOpKind::CreateIndex,
+                    coll_name,
+                    idx_name,
+                    OperationRisk::Reversible,
+                    format!("create index {idx_name} on {coll_name}"),
+                    Some(
+                        serde_json::to_string(target_idx)
+                            .map_err(|e| EngineError::Internal(e.to_string()))?,
+                    ),
+                ));
+            }
+            Some(live_idx) if live_idx != target_idx => {
+                ops.push(index_op(
+                    next_op_id(),
+                    PlanOpKind::AlterIndex,
+                    coll_name,
+                    idx_name,
+                    OperationRisk::Destructive,
+                    format!("alter index {idx_name} on {coll_name}"),
+                    Some(
+                        serde_json::to_string(target_idx)
+                            .map_err(|e| EngineError::Internal(e.to_string()))?,
+                    ),
+                ));
+            }
+            _ => {}
+        }
+    }
+    for idx_name in live.indexes.keys() {
+        if idx_name == "_id_" {
+            continue;
+        }
+        if !target.indexes.contains_key(idx_name) {
+            ops.push(index_op(
+                next_op_id(),
+                PlanOpKind::DropIndex,
+                coll_name,
+                idx_name,
+                OperationRisk::Destructive,
+                format!("drop index {idx_name} on {coll_name}"),
+                None,
+            ));
+        }
+    }
+
+    // Documents: diff by _id.
+    ops.extend(diff_documents(coll_name, target, live)?);
+
+    Ok(ops)
+}
+
+fn diff_documents(
+    coll_name: &str,
+    target: &MongoCollectionState,
+    live: &MongoCollectionState,
+) -> Result<Vec<PlanOp>, EngineError> {
+    let mut ops: Vec<PlanOp> = Vec::new();
+
+    // Index live documents by _id.
+    let mut live_by_id: std::collections::HashMap<CanonicalValue, &MongoDocument> =
+        std::collections::HashMap::new();
+    for doc in &live.documents {
+        live_by_id.insert(doc.id.clone(), doc);
+    }
+
+    let mut matched: std::collections::HashSet<CanonicalValue> = std::collections::HashSet::new();
+
+    for tdoc in &target.documents {
+        match live_by_id.get(&tdoc.id) {
+            Some(ldoc) => {
+                matched.insert(tdoc.id.clone());
+                if tdoc.fields != ldoc.fields {
+                    ops.push(document_op(
+                        next_op_id(),
+                        PlanOpKind::UpdateDocument,
+                        coll_name,
+                        OperationRisk::Destructive,
+                        format!("update document in {coll_name}"),
+                        Some(
+                            serde_json::to_string(tdoc)
+                                .map_err(|e| EngineError::Internal(e.to_string()))?,
+                        ),
+                    ));
+                }
+            }
+            None => {
+                ops.push(document_op(
+                    next_op_id(),
+                    PlanOpKind::InsertDocument,
+                    coll_name,
+                    OperationRisk::Reversible,
+                    format!("insert document into {coll_name}"),
+                    Some(
+                        serde_json::to_string(tdoc)
+                            .map_err(|e| EngineError::Internal(e.to_string()))?,
+                    ),
+                ));
+            }
+        }
+    }
+
+    // Live documents not present in target: delete them.
+    for ldoc in &live.documents {
+        if !matched.contains(&ldoc.id) {
+            ops.push(document_op(
+                next_op_id(),
+                PlanOpKind::DeleteDocument,
+                coll_name,
+                OperationRisk::Destructive,
+                format!("delete document from {coll_name}"),
+                Some(
+                    serde_json::to_string(ldoc)
+                        .map_err(|e| EngineError::Internal(e.to_string()))?,
+                ),
+            ));
+        }
+    }
+
+    Ok(ops)
+}
+
 fn next_op_id() -> String {
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -334,6 +580,97 @@ fn row_op(
             meld_core::identity::PostgresObjectId::Table {
                 schema: schema.to_string(),
                 table: table.to_string(),
+            },
+        ),
+        risk,
+        reason,
+        details,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// MongoDB plan op helpers
+// ---------------------------------------------------------------------------
+
+fn collection_op(
+    id: String,
+    kind: PlanOpKind,
+    collection: &str,
+    risk: OperationRisk,
+    reason: String,
+    details: Option<String>,
+) -> PlanOp {
+    plan_op(
+        id,
+        kind,
+        meld_core::identity::ObjectIdentity::MongoDb(
+            meld_core::identity::MongoObjectId::Collection {
+                name: collection.to_string(),
+            },
+        ),
+        risk,
+        reason,
+        details,
+    )
+}
+
+fn index_op(
+    id: String,
+    kind: PlanOpKind,
+    collection: &str,
+    index: &str,
+    risk: OperationRisk,
+    reason: String,
+    details: Option<String>,
+) -> PlanOp {
+    plan_op(
+        id,
+        kind,
+        meld_core::identity::ObjectIdentity::MongoDb(meld_core::identity::MongoObjectId::Index {
+            collection: collection.to_string(),
+            index: index.to_string(),
+        }),
+        risk,
+        reason,
+        details,
+    )
+}
+
+fn validator_op(
+    id: String,
+    collection: &str,
+    risk: OperationRisk,
+    reason: String,
+    details: Option<String>,
+) -> PlanOp {
+    plan_op(
+        id,
+        PlanOpKind::ChangeValidator,
+        meld_core::identity::ObjectIdentity::MongoDb(
+            meld_core::identity::MongoObjectId::Validator {
+                collection: collection.to_string(),
+            },
+        ),
+        risk,
+        reason,
+        details,
+    )
+}
+
+fn document_op(
+    id: String,
+    kind: PlanOpKind,
+    collection: &str,
+    risk: OperationRisk,
+    reason: String,
+    details: Option<String>,
+) -> PlanOp {
+    plan_op(
+        id,
+        kind,
+        meld_core::identity::ObjectIdentity::MongoDb(
+            meld_core::identity::MongoObjectId::Collection {
+                name: collection.to_string(),
             },
         ),
         risk,

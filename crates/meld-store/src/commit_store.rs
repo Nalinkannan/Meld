@@ -5,7 +5,7 @@
 use crate::schema::TABLE_COMMITS;
 use meld_core::MeldError;
 use meld_core::commit::Commit;
-use meld_core::ids::CommitHash;
+use meld_core::ids::{CommitHash, Hash};
 use redb::TableDefinition;
 use serde_json;
 
@@ -94,6 +94,39 @@ pub fn contains_commit(db: &redb::Database, hash: &CommitHash) -> Result<bool, M
     };
     drop(txn);
     Ok(exists)
+}
+
+/// List all commit hashes in the store.
+pub fn list_all_commit_hashes(db: &redb::Database) -> Result<Vec<CommitHash>, MeldError> {
+    let txn = db
+        .begin_read()
+        .map_err(|e| MeldError::Io(format!("begin read: {e}")))?;
+    let hashes = {
+        let table = match txn.open_table(COMMITS) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Ok(Vec::new());
+            }
+            Err(e) => {
+                return Err(MeldError::Io(format!("open commits table: {e}")));
+            }
+        };
+        let mut hashes = Vec::new();
+        for result in table
+            .range::<String>(..)
+            .map_err(|e| MeldError::Io(format!("iterate commits: {e}")))?
+        {
+            let (key, _value) =
+                result.map_err(|e| MeldError::Io(format!("iterate commits: {e}")))?;
+            let hash_str: String = key.value();
+            if let Ok(h) = Hash::from_hex(&hash_str) {
+                hashes.push(CommitHash(h));
+            }
+        }
+        hashes
+    };
+    drop(txn);
+    Ok(hashes)
 }
 
 #[cfg(test)]
