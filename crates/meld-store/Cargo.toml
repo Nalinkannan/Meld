@@ -1,0 +1,19 @@
+[package]
+name = "meld-store"
+description = "Durable local version-history storage for Meld, backed by redb and BLAKE3 content addressing."
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+meld-core = { path = "../meld-core" }
+redb = { workspace = true }
+blake3 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,26 @@
+[package]
+name = "meld-tui"
+description = "Polished full-screen Ratatui terminal user interface for Meld."
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "meld"
+path = "src/main.rs"
+
+[dependencies]
+meld-core = { path = "../meld-core" }
+meld-store = { path = "../meld-store" }
+meld-adapter = { path = "../meld-adapter" }
+meld-engine = { path = "../meld-engine" }
+tokio = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+indexmap = { workspace = true }
+
+[dev-dependencies]

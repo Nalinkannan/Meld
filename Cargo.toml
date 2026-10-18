@@ -1,6 +1,53 @@
-[package]
-name = "meld"
+[workspace]
+resolver = "2"
+members = [
+  "crates/meld-core",
+  "crates/meld-store",
+  "crates/meld-adapter",
+  "crates/meld-engine",
+  "crates/meld-tui",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 
-[dependencies]
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# Serialization / hashing / identifiers
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+indexmap = { version = "2", features = ["serde"] }
+
+# Error handling, logging, graphs
+thiserror = "1"
+tracing = "0.1"
+petgraph = "0.6"
+
+# Local version store
+redb = "2"
+
+# Database adapters
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-native-tls", "macros"] }
+mongodb = "2"
+bson = "2"
+
+# Terminal UI
+ratatui = "0.28"
+crossterm = "0.28"
+
+# Testing
+tempfile = "3"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 3

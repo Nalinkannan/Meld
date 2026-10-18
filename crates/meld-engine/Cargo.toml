@@ -1,0 +1,21 @@
+[package]
+name = "meld-engine"
+description = "Application orchestration and transaction-like workflows for Meld."
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+meld-core = { path = "../meld-core" }
+meld-store = { path = "../meld-store" }
+meld-adapter = { path = "../meld-adapter" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+petgraph = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

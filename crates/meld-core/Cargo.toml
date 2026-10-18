@@ -1,0 +1,19 @@
+[package]
+name = "meld-core"
+description = "Pure domain logic for Meld: state model, canonical hashing, diffs, commits, merge, and verification."
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+indexmap = { workspace = true }
+petgraph = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]

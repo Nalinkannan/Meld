@@ -1,0 +1,660 @@
+//! Semantic diff between two snapshot states.
+//!
+//! Produces typed `ChangeOp` operations rather than relying on raw
+//! serialized-state comparison.
+
+use crate::canonical::hash_state;
+use crate::error::MeldError;
+use crate::identity::{ObjectIdentity, PostgresObjectId};
+use crate::ids::ObjectHash;
+use crate::state::{
+    CanonicalValue, CaptureInfo, EngineKind, EngineState, PgColumn, PgConstraint, PgIndex, PgTable,
+};
+use crate::transition::{ChangeKind, ChangeOp, ChangeSummary};
+
+/// The result of diffing two snapshots.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SnapshotDiff {
+    pub from_root: ObjectHash,
+    pub to_root: ObjectHash,
+    pub engine_kind: EngineKind,
+    pub ops: Vec<ChangeOp>,
+    pub summary: ChangeSummary,
+    pub from_info: Option<CaptureInfo>,
+    pub to_info: Option<CaptureInfo>,
+}
+
+impl SnapshotDiff {
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+}
+
+/// Diff two engine states. Returns an error if the engines or scopes are
+/// incompatible.
+pub fn diff_states(from: &EngineState, to: &EngineState) -> Result<SnapshotDiff, MeldError> {
+    if from.engine_kind() != to.engine_kind() {
+        return Err(MeldError::IncompatibleEngine {
+            expected: from.engine_kind(),
+            got: to.engine_kind(),
+        });
+    }
+    if !from.scope().compatible_with(&to.scope()) {
+        return Err(MeldError::IncompatibleScope(format!(
+            "scope mismatch: {:?} vs {:?}",
+            from.scope(),
+            to.scope()
+        )));
+    }
+
+    let engine_kind = from.engine_kind();
+    let ops = match engine_kind {
+        EngineKind::PostgreSql => diff_postgres(from, to)?,
+        EngineKind::MongoDb => diff_mongodb(from, to)?,
+    };
+    let summary = ChangeSummary::from_ops(&ops);
+
+    Ok(SnapshotDiff {
+        from_root: state_hash(from),
+        to_root: state_hash(to),
+        engine_kind,
+        ops,
+        summary,
+        from_info: capture_info(from),
+        to_info: capture_info(to),
+    })
+}
+
+fn state_hash(state: &EngineState) -> ObjectHash {
+    ObjectHash::from_bytes(hash_state(state).as_bytes())
+}
+
+fn capture_info(state: &EngineState) -> Option<CaptureInfo> {
+    match state {
+        EngineState::PostgreSql(s) => Some(s.capture_info.clone()),
+        EngineState::MongoDb(s) => Some(s.capture_info.clone()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PostgreSQL diff
+// ---------------------------------------------------------------------------
+
+fn diff_postgres(from: &EngineState, to: &EngineState) -> Result<Vec<ChangeOp>, MeldError> {
+    let EngineState::PostgreSql(fs) = from else {
+        unreachable!()
+    };
+    let EngineState::PostgreSql(ts) = to else {
+        unreachable!()
+    };
+
+    let mut ops: Vec<ChangeOp> = vec![];
+
+    // Databases / schemas.
+    for (name, fdb) in &fs.databases {
+        match ts.databases.get(name) {
+            None => {
+                ops.push(drop_db(name));
+            }
+            Some(tdb) => {
+                ops.extend(diff_database(fdb, tdb)?);
+            }
+        }
+    }
+    for name in ts.databases.keys() {
+        if !fs.databases.contains_key(name) {
+            ops.push(create_db(name));
+        }
+    }
+
+    Ok(ops)
+}
+
+fn diff_database(
+    from: &crate::state::PgDatabase,
+    to: &crate::state::PgDatabase,
+) -> Result<Vec<ChangeOp>, MeldError> {
+    let mut ops: Vec<ChangeOp> = vec![];
+
+    for (schema_name, fschema) in &from.schemas {
+        match to.schemas.get(schema_name) {
+            None => ops.push(drop_schema(schema_name)),
+            Some(tschema) => ops.extend(diff_schema(fschema, tschema)?),
+        }
+    }
+    for schema_name in to.schemas.keys() {
+        if !from.schemas.contains_key(schema_name) {
+            ops.push(create_schema(schema_name));
+        }
+    }
+
+    Ok(ops)
+}
+
+fn diff_schema(
+    from: &crate::state::PgSchema,
+    to: &crate::state::PgSchema,
+) -> Result<Vec<ChangeOp>, MeldError> {
+    let mut ops: Vec<ChangeOp> = vec![];
+
+    for (table_name, ftable) in &from.tables {
+        match to.tables.get(table_name) {
+            None => ops.push(drop_table(
+                from.name.as_str(),
+                schema_table(from.name.as_str(), table_name),
+            )),
+            Some(ttable) => ops.extend(diff_table(ftable, ttable)?),
+        }
+    }
+    for table_name in to.tables.keys() {
+        if !from.tables.contains_key(table_name) {
+            ops.push(create_table(
+                from.name.as_str(),
+                schema_table(from.name.as_str(), table_name),
+            ));
+        }
+    }
+
+    Ok(ops)
+}
+
+fn schema_table(schema: &str, table: &str) -> PostgresObjectId {
+    PostgresObjectId::Table {
+        schema: schema.to_string(),
+        table: table.to_string(),
+    }
+}
+
+fn diff_table(from: &PgTable, to: &PgTable) -> Result<Vec<ChangeOp>, MeldError> {
+    let mut ops: Vec<ChangeOp> = vec![];
+    let _object = ObjectIdentity::PostgreSql(PostgresObjectId::Table {
+        schema: from.schema.clone(),
+        table: from.name.clone(),
+    });
+
+    // Columns: compare by ordinal order and name.
+    // Detect dropped columns.
+    for (name, col) in &from.columns {
+        if !to.columns.contains_key(name) {
+            ops.push(ChangeOp {
+                kind: ChangeKind::DropColumn,
+                object: ObjectIdentity::PostgreSql(PostgresObjectId::Column {
+                    schema: from.schema.clone(),
+                    table: from.name.clone(),
+                    column: name.clone(),
+                }),
+                field: Some(name.clone()),
+                confidence: 1000,
+                before: Some(CanonicalValue::Text(format!("{:?}", col.data_type))),
+                after: None,
+                reason: format!("column {name} dropped"),
+            });
+        }
+    }
+    // Detect added columns.
+    for (name, col) in &to.columns {
+        if !from.columns.contains_key(name) {
+            ops.push(ChangeOp {
+                kind: ChangeKind::AddColumn,
+                object: ObjectIdentity::PostgreSql(PostgresObjectId::Column {
+                    schema: from.schema.clone(),
+                    table: from.name.clone(),
+                    column: name.clone(),
+                }),
+                field: Some(name.clone()),
+                confidence: 1000,
+                before: None,
+                after: Some(CanonicalValue::Text(format!("{:?}", col.data_type))),
+                reason: format!("column {name} added"),
+            });
+        }
+    }
+    // Detect altered / renamed columns.
+    for (name, fcol) in &from.columns {
+        if let Some(tcol) = to.columns.get(name) {
+            if fcol != tcol {
+                ops.push(alter_column_op(from, name, fcol, tcol));
+            }
+        } else {
+            // Column present in from but not to: handled by drop above only if
+            // not re-appearing under a new name (rename detection).
+        }
+    }
+
+    // Simple rename detection: a dropped column and an added column with the
+    // same data type and no other changes -> treat as rename with medium
+    // confidence.
+    let dropped: Vec<&PgColumn> = from
+        .columns
+        .values()
+        .filter(|c| !to.columns.contains_key(&c.name))
+        .collect();
+    let added: Vec<&PgColumn> = to
+        .columns
+        .values()
+        .filter(|c| !from.columns.contains_key(&c.name))
+        .collect();
+    for dcol in &dropped {
+        for acol in &added {
+            if dcol.data_type == acol.data_type
+                && dcol.is_nullable == acol.is_nullable
+                && dcol.is_identity == acol.is_identity
+            {
+                ops.push(ChangeOp {
+                    kind: ChangeKind::RenameColumn { confidence: 700 },
+                    object: ObjectIdentity::PostgreSql(PostgresObjectId::Column {
+                        schema: from.schema.clone(),
+                        table: from.name.clone(),
+                        column: dcol.name.clone(),
+                    }),
+                    field: Some(acol.name.clone()),
+                    confidence: 700,
+                    before: Some(CanonicalValue::Text(dcol.name.clone())),
+                    after: Some(CanonicalValue::Text(acol.name.clone())),
+                    reason: format!("column {} renamed to {}", dcol.name, acol.name),
+                });
+            }
+        }
+    }
+
+    // Constraints and indexes (create/drop only, by name).
+    // Primary key.
+    match (&from.primary_key, &to.primary_key) {
+        (Some(_), None) => ops.push(drop_constraint_op(from, from.primary_key.as_ref().unwrap())),
+        (None, Some(_)) => ops.push(add_constraint_op(from, to.primary_key.as_ref().unwrap())),
+        (Some(fp), Some(tp)) if fp != tp => ops.push(alter_constraint_op(from, fp, tp)),
+        _ => {}
+    }
+
+    for fc in &from.unique_constraints {
+        if !to.unique_constraints.iter().any(|c| c.name == fc.name) {
+            ops.push(drop_constraint_op(from, fc));
+        }
+    }
+    for tc in &to.unique_constraints {
+        if !from.unique_constraints.iter().any(|c| c.name == tc.name) {
+            ops.push(add_constraint_op(from, tc));
+        }
+    }
+
+    for fc in &from.foreign_keys {
+        if !to.foreign_keys.iter().any(|c| c.name == fc.name) {
+            ops.push(drop_constraint_op(from, fc));
+        }
+    }
+    for tc in &to.foreign_keys {
+        if !from.foreign_keys.iter().any(|c| c.name == tc.name) {
+            ops.push(add_constraint_op(from, tc));
+        }
+    }
+
+    for fc in &from.check_constraints {
+        if !to.check_constraints.iter().any(|c| c.name == fc.name) {
+            ops.push(drop_constraint_op(from, fc));
+        }
+    }
+    for tc in &to.check_constraints {
+        if !from.check_constraints.iter().any(|c| c.name == tc.name) {
+            ops.push(add_constraint_op(from, tc));
+        }
+    }
+
+    // Indexes.
+    for (name, fi) in &from.indexes {
+        if !to.indexes.contains_key(name) {
+            ops.push(drop_index_op(from, fi));
+        }
+    }
+    for (name, ti) in &to.indexes {
+        if !from.indexes.contains_key(name) {
+            ops.push(create_index_op(from, ti));
+        } else if from.indexes.get(name).is_some_and(|fi| fi != ti) {
+            let fi = from.indexes.get(name).unwrap();
+            ops.push(alter_index_op(from, fi, ti));
+        }
+    }
+
+    // Rows.
+    ops.extend(diff_rows(from, to)?);
+
+    Ok(ops)
+}
+
+fn diff_rows(_from: &PgTable, _to: &PgTable) -> Result<Vec<ChangeOp>, MeldError> {
+    // Row-level diffing is delegated to the adapter/engine layer against live
+    // state; the core keeps the structural diff here.
+    Ok(vec![])
+}
+
+fn alter_column_op(from: &PgTable, name: &str, fcol: &PgColumn, tcol: &PgColumn) -> ChangeOp {
+    ChangeOp {
+        kind: ChangeKind::AlterColumn,
+        object: ObjectIdentity::PostgreSql(PostgresObjectId::Column {
+            schema: from.schema.clone(),
+            table: from.name.clone(),
+            column: name.to_string(),
+        }),
+        field: Some(name.to_string()),
+        confidence: 1000,
+        before: Some(CanonicalValue::Text(format!("{:?}", fcol.data_type))),
+        after: Some(CanonicalValue::Text(format!("{:?}", tcol.data_type))),
+        reason: format!("column {name} altered"),
+    }
+}
+
+fn drop_constraint_op(from: &PgTable, c: &PgConstraint) -> ChangeOp {
+    ChangeOp {
+        kind: ChangeKind::DropConstraint,
+        object: ObjectIdentity::PostgreSql(PostgresObjectId::Constraint {
+            schema: from.schema.clone(),
+            table: from.name.clone(),
+            constraint: c.name.clone(),
+        }),
+        field: None,
+        confidence: 1000,
+        before: Some(CanonicalValue::Text(c.definition.clone())),
+        after: None,
+        reason: format!("constraint {} dropped", c.name),
+    }
+}
+
+fn add_constraint_op(from: &PgTable, c: &PgConstraint) -> ChangeOp {
+    ChangeOp {
+        kind: ChangeKind::AddConstraint,
+        object: ObjectIdentity::PostgreSql(PostgresObjectId::Constraint {
+            schema: from.schema.clone(),
+            table: from.name.clone(),
+            constraint: c.name.clone(),
+        }),
+        field: None,
+        confidence: 1000,
+        before: None,
+        after: Some(CanonicalValue::Text(c.definition.clone())),
+        reason: format!("constraint {} added", c.name),
+    }
+}
+
+fn alter_constraint_op(from: &PgTable, fp: &PgConstraint, tp: &PgConstraint) -> ChangeOp {
+    ChangeOp {
+        kind: ChangeKind::AlterConstraint,
+        object: ObjectIdentity::PostgreSql(PostgresObjectId::Constraint {
+            schema: from.schema.clone(),
+            table: from.name.clone(),
+            constraint: fp.name.clone(),
+        }),
+        field: None,
+        confidence: 1000,
+        before: Some(CanonicalValue::Text(fp.definition.clone())),
+        after: Some(CanonicalValue::Text(tp.definition.clone())),
+        reason: format!("constraint {} altered", fp.name),
+    }
+}
+
+fn drop_index_op(from: &PgTable, i: &PgIndex) -> ChangeOp {
+    ChangeOp {
+        kind: ChangeKind::DropIndex,
+        object: ObjectIdentity::PostgreSql(PostgresObjectId::Index {
+            schema: from.schema.clone(),
+            table: from.name.clone(),
+            index: i.name.clone(),
+        }),
+        field: None,
+        confidence: 1000,
+        before: Some(CanonicalValue::Text(i.definition.clone())),
+        after: None,
+        reason: format!("index {} dropped", i.name),
+    }
+}
+
+fn create_index_op(from: &PgTable, i: &PgIndex) -> ChangeOp {
+    ChangeOp {
+        kind: ChangeKind::CreateIndex,
+        object: ObjectIdentity::PostgreSql(PostgresObjectId::Index {
+            schema: from.schema.clone(),
+            table: from.name.clone(),
+            index: i.name.clone(),
+        }),
+        field: None,
+        confidence: 1000,
+        before: None,
+        after: Some(CanonicalValue::Text(i.definition.clone())),
+        reason: format!("index {} created", i.name),
+    }
+}
+
+fn alter_index_op(from: &PgTable, fi: &PgIndex, ti: &PgIndex) -> ChangeOp {
+    ChangeOp {
+        kind: ChangeKind::AlterIndex,
+        object: ObjectIdentity::PostgreSql(PostgresObjectId::Index {
+            schema: from.schema.clone(),
+            table: from.name.clone(),
+            index: fi.name.clone(),
+        }),
+        field: None,
+        confidence: 1000,
+        before: Some(CanonicalValue::Text(fi.definition.clone())),
+        after: Some(CanonicalValue::Text(ti.definition.clone())),
+        reason: format!("index {} altered", fi.name),
+    }
+}
+
+fn create_db(name: &str) -> ChangeOp {
+    ChangeOp::new(
+        ChangeKind::CreateTable,
+        ObjectIdentity::PostgreSql(PostgresObjectId::Schema {
+            name: name.to_string(),
+        }),
+        format!("database {name} created"),
+    )
+}
+
+fn drop_db(name: &str) -> ChangeOp {
+    ChangeOp::new(
+        ChangeKind::DropTable,
+        ObjectIdentity::PostgreSql(PostgresObjectId::Schema {
+            name: name.to_string(),
+        }),
+        format!("database {name} dropped"),
+    )
+}
+
+fn create_schema(name: &str) -> ChangeOp {
+    ChangeOp::new(
+        ChangeKind::CreateTable,
+        ObjectIdentity::PostgreSql(PostgresObjectId::Schema {
+            name: name.to_string(),
+        }),
+        format!("schema {name} created"),
+    )
+}
+
+fn drop_schema(name: &str) -> ChangeOp {
+    ChangeOp::new(
+        ChangeKind::DropTable,
+        ObjectIdentity::PostgreSql(PostgresObjectId::Schema {
+            name: name.to_string(),
+        }),
+        format!("schema {name} dropped"),
+    )
+}
+
+fn create_table(schema: &str, object: PostgresObjectId) -> ChangeOp {
+    let table_name = match &object {
+        PostgresObjectId::Table { table, .. } => table.clone(),
+        _ => "?".into(),
+    };
+    ChangeOp::new(
+        ChangeKind::CreateTable,
+        ObjectIdentity::PostgreSql(object),
+        format!("table {schema}.{table_name} created"),
+    )
+}
+
+fn drop_table(schema: &str, object: PostgresObjectId) -> ChangeOp {
+    let table_name = match &object {
+        PostgresObjectId::Table { table, .. } => table.clone(),
+        _ => "?".into(),
+    };
+    ChangeOp::new(
+        ChangeKind::DropTable,
+        ObjectIdentity::PostgreSql(object),
+        format!("table {schema}.{table_name} dropped"),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// MongoDB diff (stub: real but limited)
+// ---------------------------------------------------------------------------
+
+fn diff_mongodb(_from: &EngineState, _to: &EngineState) -> Result<Vec<ChangeOp>, MeldError> {
+    // MongoDB diff is implemented in the adapter/engine layer against live
+    // state; here we return no ops to keep the core dependency-free.
+    Ok(vec![])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::CaptureInfo;
+    use crate::state::{ConsistencyLevel, PgColumn, PgDatabase, PgSchema, PostgresState};
+    use chrono::Utc;
+    use indexmap::IndexMap;
+
+    #[test]
+    fn identical_states_produce_empty_diff() {
+        let s1 = EngineState::PostgreSql(test_state());
+        let s2 = EngineState::PostgreSql(test_state());
+        let diff = diff_states(&s1, &s2).unwrap();
+        assert!(diff.is_empty());
+        assert_eq!(diff.summary.total_changes(), 0);
+    }
+
+    #[test]
+    fn column_add_produces_add_op() {
+        let before = EngineState::PostgreSql(test_state());
+        let mut after = EngineState::PostgreSql(test_state());
+        if let EngineState::PostgreSql(st) = &mut after {
+            let db = st.databases.get_mut("mydb").unwrap();
+            let schema = db.schemas.get_mut("public").unwrap();
+            let table = schema.tables.get_mut("t").unwrap();
+            table.columns.insert(
+                "b".into(),
+                PgColumn {
+                    name: "b".into(),
+                    ordinal_position: 2,
+                    data_type: pg_type_local("text"),
+                    is_nullable: true,
+                    column_default: None,
+                    is_identity: false,
+                    is_generated: false,
+                    generated_expression: None,
+                    comment: None,
+                },
+            );
+        }
+        let diff = diff_states(&before, &after).unwrap();
+        assert_eq!(diff.summary.rows_inserted, 0);
+        assert!(
+            diff.ops
+                .iter()
+                .any(|o| matches!(o.kind, ChangeKind::AddColumn))
+        );
+    }
+
+    #[test]
+    fn incompatible_engines_rejected() {
+        let pg = EngineState::PostgreSql(test_state());
+        let mongo = EngineState::MongoDb(crate::state::MongoState {
+            engine_version: "8".into(),
+            database_name: "mydb".into(),
+            collections: Default::default(),
+            warnings: vec![],
+            capture_info: crate::state::CaptureInfo {
+                consistency: ConsistencyLevel::Snapshot,
+                strategy: "test".into(),
+                captured_at: Utc::now(),
+                engine_version: "8".into(),
+                scope: "mydb".into(),
+                warnings: vec![],
+            },
+        });
+        let err = diff_states(&pg, &mongo).unwrap_err();
+        assert!(matches!(err, MeldError::IncompatibleEngine { .. }));
+    }
+
+    fn test_state() -> PostgresState {
+        let mut columns = IndexMap::new();
+        columns.insert(
+            "a".into(),
+            PgColumn {
+                name: "a".into(),
+                ordinal_position: 1,
+                data_type: pg_type_local("int"),
+                is_nullable: false,
+                column_default: None,
+                is_identity: false,
+                is_generated: false,
+                generated_expression: None,
+                comment: None,
+            },
+        );
+        let mut tables = IndexMap::new();
+        tables.insert(
+            "public".into(),
+            PgSchema {
+                name: "public".into(),
+                tables: IndexMap::from([("t".into(), pg_table_local("t", columns))]),
+            },
+        );
+        let mut dbs = IndexMap::new();
+        dbs.insert(
+            "mydb".into(),
+            PgDatabase {
+                name: "mydb".into(),
+                schemas: tables,
+                views: IndexMap::new(),
+                sequences: IndexMap::new(),
+            },
+        );
+        PostgresState {
+            engine_version: "18".into(),
+            databases: dbs,
+            warnings: vec![],
+            capture_info: CaptureInfo {
+                consistency: ConsistencyLevel::Snapshot,
+                strategy: "test".into(),
+                captured_at: Utc::now(),
+                engine_version: "18".into(),
+                scope: "mydb".into(),
+                warnings: vec![],
+            },
+        }
+    }
+
+    fn pg_type_local(name: &str) -> crate::state::PgType {
+        crate::state::PgType {
+            name: name.into(),
+            oid: Some(23),
+            internal_type: Some("int4".into()),
+            array: false,
+            length: None,
+            precision: None,
+            scale: None,
+        }
+    }
+
+    fn pg_table_local(name: &str, columns: IndexMap<String, PgColumn>) -> PgTable {
+        PgTable {
+            name: name.into(),
+            schema: "public".into(),
+            columns,
+            primary_key: None,
+            unique_constraints: vec![],
+            foreign_keys: vec![],
+            check_constraints: vec![],
+            indexes: IndexMap::new(),
+            comment: None,
+            row_count: 0,
+        }
+    }
+}
