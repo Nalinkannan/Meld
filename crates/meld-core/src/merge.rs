@@ -245,6 +245,7 @@ mod tests {
             indexes: IndexMap::new(),
             comment: None,
             row_count: 0,
+            rows: vec![],
         }
     }
 
@@ -412,6 +413,7 @@ mod tests {
             indexes: IndexMap::new(),
             comment: None,
             row_count: 0,
+            rows: vec![],
         }
     }
 

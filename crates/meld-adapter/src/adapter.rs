@@ -65,7 +65,7 @@ pub struct ExecutionResult {
 }
 
 /// Snapshot capture result returned by the engine.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotResult {
     pub commit: Commit,
     pub commit_hash: CommitHash,
@@ -95,13 +95,22 @@ pub trait DatabaseAdapter: Send + Sync + std::fmt::Debug {
     /// Capture the current database state (a snapshot).
     async fn introspect(&self) -> Result<EngineState, MeldError>;
 
+    /// Extract rows for a table (PostgreSQL). Used by the engine to build
+    /// row-aware restore plans.
+    async fn extract_table_rows(
+        &self,
+        table: &meld_core::state::PgTable,
+    ) -> Result<Vec<meld_core::state::PgRow>, MeldError>;
+
     /// Independently compare the live database against a target state.
     async fn verify(
         &self,
         target: &EngineState,
     ) -> Result<meld_core::verify::VerificationReport, MeldError>;
 
-    /// Execute a dependency-aware restore plan against the live database.
+    /// Execute a dependency-aware restore plan against the live database,
+    /// transforming it into the plan's target state. The plan's operations
+    /// carry their execution details; the adapter applies them in order.
     async fn execute_restore_plan(
         &self,
         plan: &meld_core::plan::RestorePlan,

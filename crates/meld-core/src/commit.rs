@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 pub const COMMIT_FORMAT_VERSION: u32 = 1;
 
 /// An immutable commit representing a snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Commit {
     pub hash: CommitHash,
     pub parents: Vec<CommitHash>,
@@ -23,17 +23,22 @@ pub struct Commit {
     pub root_hash: ObjectHash,
     pub change_summary: ChangeSummary,
     pub format_version: u32,
+    /// The full captured state. Stored so the commit is self-contained and a
+    /// historical state can be reconstructed without re-introspection.
+    pub state: crate::state::EngineState,
 }
 
 impl Commit {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         parents: Vec<CommitHash>,
         author: impl Into<String>,
         message: impl Into<String>,
-        engine_kind: EngineKind,
-        scope: SnapshotScope,
+        engine_kind: crate::state::EngineKind,
+        scope: crate::state::SnapshotScope,
         root_hash: ObjectHash,
         change_summary: ChangeSummary,
+        state: crate::state::EngineState,
     ) -> Self {
         let timestamp = Utc::now();
         let mut commit = Commit {
@@ -47,6 +52,7 @@ impl Commit {
             root_hash,
             change_summary,
             format_version: COMMIT_FORMAT_VERSION,
+            state,
         };
         commit.hash = CommitHash(commit.content_hash());
         commit
@@ -98,8 +104,11 @@ impl Canonicalize for Commit {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{EngineKind, SnapshotScope};
+    use crate::state::{
+        CaptureInfo, ConsistencyLevel, EngineKind, EngineState, PostgresState, SnapshotScope,
+    };
     use crate::transition::ChangeSummary;
+    use indexmap::IndexMap;
 
     fn sample_scope() -> SnapshotScope {
         SnapshotScope::postgres("meld_test")
@@ -109,6 +118,7 @@ mod tests {
     fn commit_content_hash_is_deterministic() {
         let summary = ChangeSummary::default();
         let root = ObjectHash::from_bytes([1u8; 32]);
+        let state = sample_state();
         let c1 = Commit::new(
             vec![],
             "alice",
@@ -117,6 +127,7 @@ mod tests {
             sample_scope(),
             root,
             summary.clone(),
+            state.clone(),
         );
         // A clone preserves the hash exactly.
         let c2 = c1.clone();
@@ -140,6 +151,7 @@ mod tests {
             sample_scope(),
             root,
             ChangeSummary::default(),
+            state,
         );
         assert_ne!(c1.hash, c3.hash);
     }
@@ -155,8 +167,25 @@ mod tests {
             SnapshotScope::mongodb("db"),
             ObjectHash::from_bytes([2u8; 32]),
             summary,
+            sample_state(),
         );
         assert!(c.is_merge());
         assert!(!c.is_initial());
+    }
+
+    fn sample_state() -> EngineState {
+        EngineState::PostgreSql(PostgresState {
+            engine_version: "18".into(),
+            databases: IndexMap::new(),
+            warnings: vec![],
+            capture_info: CaptureInfo {
+                consistency: ConsistencyLevel::Snapshot,
+                strategy: "test".into(),
+                captured_at: Utc::now(),
+                engine_version: "18".into(),
+                scope: "meld_test".into(),
+                warnings: vec![],
+            },
+        })
     }
 }

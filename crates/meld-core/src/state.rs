@@ -509,6 +509,8 @@ pub struct PgTable {
     pub indexes: IndexMap<String, PgIndex>,
     pub comment: Option<String>,
     pub row_count: u64,
+    /// Data rows (stable identity via primary key or content hash).
+    pub rows: Vec<PgRow>,
 }
 
 impl Canonicalize for PgTable {
@@ -587,6 +589,21 @@ impl Canonicalize for PgTable {
             None => out.push(0x00),
         }
         write_u64(out, self.row_count);
+        // Rows: identity + values.
+        for row in &self.rows {
+            match &row.identity {
+                PgRowIdentity::PrimaryKey(values) => {
+                    out.push(0x01);
+                    write_sequence(out, values);
+                }
+                PgRowIdentity::ContentHash(bytes) => {
+                    out.push(0x00);
+                    write_bytes(out, bytes);
+                }
+            }
+            let entries: Vec<_> = row.values.iter().collect();
+            write_sorted_map(out, &entries);
+        }
     }
 }
 
@@ -1231,6 +1248,7 @@ mod tests {
             indexes: IndexMap::new(),
             comment: None,
             row_count: 0,
+            rows: vec![],
         }
     }
 

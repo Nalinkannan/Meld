@@ -39,6 +39,9 @@ pub struct PlanOp {
     pub depends_on: Vec<String>,
     pub reason: String,
     pub requires_confirmation: bool,
+    /// Execution details (JSON) for the adapter, e.g. column definitions or
+    /// row values. Present when the plan op needs more than the object identity.
+    pub details: Option<String>,
 }
 
 /// The kind of planned operation.
@@ -47,6 +50,9 @@ pub enum PlanOpKind {
     CreateObject,
     DropObject,
     AlterObject,
+    AddColumn,
+    DropColumn,
+    AlterColumn,
     InsertData,
     UpdateData,
     DeleteData,
@@ -227,6 +233,7 @@ mod tests {
             depends_on: depends.iter().map(|s| s.to_string()).collect(),
             reason: "test".into(),
             requires_confirmation: matches!(risk, OperationRisk::Destructive),
+            details: None,
         }
     }
 
@@ -268,6 +275,7 @@ mod tests {
                 depends_on: vec!["b".into()],
                 reason: "t".into(),
                 requires_confirmation: false,
+                details: None,
             },
             PlanOp {
                 id: "b".into(),
@@ -277,6 +285,7 @@ mod tests {
                 depends_on: vec!["a".into()],
                 reason: "t".into(),
                 requires_confirmation: false,
+                details: None,
             },
         ]);
         let err = plan.ordered_ops().unwrap_err();

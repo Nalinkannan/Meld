@@ -226,6 +226,7 @@ pub fn set_head(db: &redb::Database, target: &CommitHash) -> Result<(), MeldErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
     use meld_core::ids::ObjectHash;
     use meld_core::state::{EngineKind, SnapshotScope};
     use meld_core::transition::ChangeSummary;
@@ -240,6 +241,19 @@ mod tests {
             SnapshotScope::postgres("db"),
             ObjectHash::from_bytes(hash),
             ChangeSummary::default(),
+            meld_core::state::EngineState::PostgreSql(meld_core::state::PostgresState {
+                engine_version: "18".into(),
+                databases: indexmap::IndexMap::new(),
+                warnings: vec![],
+                capture_info: meld_core::state::CaptureInfo {
+                    consistency: meld_core::state::ConsistencyLevel::Snapshot,
+                    strategy: "test".into(),
+                    captured_at: Utc::now(),
+                    engine_version: "18".into(),
+                    scope: "db".into(),
+                    warnings: vec![],
+                },
+            }),
         )
     }
 

@@ -10,6 +10,8 @@ use meld_core::state::{
     CaptureInfo, ConsistencyLevel, PgColumn, PgConstraint, PgDatabase, PgIndex, PgIndexColumn,
     PgSchema, PgSequence, PgTable, PgType, PgView, PostgresState,
 };
+
+use super::extract::extract_table_rows;
 use sqlx::Row;
 use tracing::debug;
 
@@ -142,6 +144,21 @@ pub async fn introspect(pool: &sqlx::PgPool) -> Result<meld_core::state::EngineS
                 .await
                 .unwrap_or(0);
 
+            let temp_table = PgTable {
+                name: table_name.clone(),
+                schema: schema_name.clone(),
+                columns: columns.clone(),
+                primary_key: primary_key.clone(),
+                unique_constraints: unique_constraints.clone(),
+                foreign_keys: foreign_keys.clone(),
+                check_constraints: check_constraints.clone(),
+                indexes: indexes.clone(),
+                comment: None,
+                row_count,
+                rows: vec![],
+            };
+            let rows = extract_table_rows(pool, &temp_table, None).await?;
+
             tables.insert(
                 table_name.clone(),
                 PgTable {
@@ -155,6 +172,7 @@ pub async fn introspect(pool: &sqlx::PgPool) -> Result<meld_core::state::EngineS
                     indexes,
                     comment: None,
                     row_count,
+                    rows,
                 },
             );
         }

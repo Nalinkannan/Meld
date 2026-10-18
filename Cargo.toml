@@ -35,7 +35,7 @@ petgraph = "0.6"
 redb = "2"
 
 # Database adapters
-sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-native-tls", "macros"] }
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-native-tls", "macros", "bigdecimal", "uuid", "chrono", "json"] }
 mongodb = "2"
 bson = "2"
 

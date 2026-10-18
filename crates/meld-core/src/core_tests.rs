@@ -110,6 +110,7 @@ fn destructive_plan_requires_confirmation() {
         depends_on: vec![],
         reason: "drop collection".into(),
         requires_confirmation: true,
+        details: None,
     };
     assert!(op.requires_confirmation);
     assert!(op.risk.is_destructive());

@@ -188,8 +188,11 @@ mod tests {
     use super::*;
     use crate::commit::Commit;
     use crate::ids::ObjectHash;
-    use crate::state::{EngineKind, SnapshotScope};
+    use crate::state::{
+        CaptureInfo, ConsistencyLevel, EngineKind, EngineState, PostgresState, SnapshotScope,
+    };
     use crate::transition::ChangeSummary;
+    use indexmap::IndexMap;
 
     fn commit(root: [u8; 32], parents: &[CommitHash]) -> Commit {
         Commit::new(
@@ -200,7 +203,24 @@ mod tests {
             SnapshotScope::postgres("db"),
             ObjectHash::from_bytes(root),
             ChangeSummary::default(),
+            sample_state(),
         )
+    }
+
+    fn sample_state() -> EngineState {
+        EngineState::PostgreSql(PostgresState {
+            engine_version: "18".into(),
+            databases: IndexMap::new(),
+            warnings: vec![],
+            capture_info: CaptureInfo {
+                consistency: ConsistencyLevel::Snapshot,
+                strategy: "test".into(),
+                captured_at: chrono::Utc::now(),
+                engine_version: "18".into(),
+                scope: "db".into(),
+                warnings: vec![],
+            },
+        })
     }
 
     #[test]

@@ -155,6 +155,15 @@ impl DatabaseAdapter for MongoAdapter {
         Ok(())
     }
 
+    async fn extract_table_rows(
+        &self,
+        _table: &meld_core::state::PgTable,
+    ) -> Result<Vec<meld_core::state::PgRow>, MeldError> {
+        Err(MeldError::Unsupported(
+            "row extraction not implemented for MongoDB".into(),
+        ))
+    }
+
     async fn introspect(&self) -> Result<EngineState, MeldError> {
         introspect::introspect(self.client()?, self.db_name()?).await
     }

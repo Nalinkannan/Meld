@@ -141,6 +141,13 @@ impl DatabaseAdapter for PostgresAdapter {
         Ok(())
     }
 
+    async fn extract_table_rows(
+        &self,
+        table: &meld_core::state::PgTable,
+    ) -> Result<Vec<meld_core::state::PgRow>, MeldError> {
+        extract::extract_table_rows(self.pool()?, table, None).await
+    }
+
     async fn introspect(&self) -> Result<EngineState, MeldError> {
         introspect::introspect(self.pool()?).await
     }
