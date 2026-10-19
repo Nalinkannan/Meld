@@ -7,6 +7,7 @@ use meld_adapter::{ConnectionConfig, ConnectionInfo, DatabaseAdapter, registry::
 use meld_core::ids::CommitHash;
 use meld_core::state::EngineKind;
 use meld_store::Store;
+use tracing::debug;
 
 use crate::error::EngineError;
 
@@ -44,6 +45,21 @@ impl Session {
             ConnectionConfig::PostgreSql(_) => EngineKind::PostgreSql,
             ConnectionConfig::MongoDb(_) => EngineKind::MongoDb,
         };
+        let (host, port, database) = match &config {
+            ConnectionConfig::PostgreSql(pg) => {
+                (pg.host.as_str(), Some(pg.port), pg.database.as_str())
+            }
+            ConnectionConfig::MongoDb(mongo) => {
+                (mongo.host.as_deref().unwrap_or("localhost"), mongo.port, mongo.database.as_str())
+            }
+        };
+        debug!(
+            host = %host,
+            port = ?port,
+            database = %database,
+            engine = ?engine_kind,
+            "connecting to database"
+        );
         let mut adapter = AdapterRegistry::new().adapter_for(engine_kind);
         let info = adapter
             .connect(&config)
@@ -52,6 +68,29 @@ impl Session {
         self.connection = Some(config);
         self.adapter = Some(adapter);
         Ok(info)
+    }
+
+    /// Install an already-connected adapter into the session, replacing any
+    /// existing one. Returns the previous `(adapter, config)` pair so the
+    /// caller can disconnect the old adapter outside the session lock.
+    pub fn install_adapter(
+        &mut self,
+        adapter: Box<dyn DatabaseAdapter>,
+        config: ConnectionConfig,
+    ) -> Option<(Box<dyn DatabaseAdapter>, ConnectionConfig)> {
+        let old_adapter = self.adapter.take();
+        let old_config = self.connection.take();
+        self.adapter = Some(adapter);
+        self.connection = Some(config);
+        old_adapter.zip(old_config)
+    }
+
+    /// Return the name of the currently connected profile, if any.
+    pub fn connection_name(&self) -> Option<&str> {
+        self.connection.as_ref().map(|config| match config {
+            ConnectionConfig::PostgreSql(pg) => pg.name.as_str(),
+            ConnectionConfig::MongoDb(mongo) => mongo.name.as_str(),
+        })
     }
 
     /// Disconnect from the database (keeping the local store open).
@@ -65,6 +104,14 @@ impl Session {
         self.adapter = None;
         self.connection = None;
         Ok(())
+    }
+
+    /// Remove the connected adapter (and connection config) without
+    /// disconnecting it, returning it so the caller can disconnect outside the
+    /// session lock (avoiding holding a `MutexGuard` across an `.await`).
+    pub fn take_adapter(&mut self) -> Option<Box<dyn DatabaseAdapter>> {
+        self.connection = None;
+        self.adapter.take()
     }
 
     /// Return the currently connected adapter (required for most operations).

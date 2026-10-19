@@ -341,8 +341,8 @@ mod tests {
         b.insert("é"); // 2 bytes, 1 grapheme, width 1
         b.insert("日"); // 3 bytes, width 2
         assert_eq!(b.text(), "abé日");
-        // Cursor is after all three graphemes.
-        assert_eq!(b.cursor_grapheme(), 3);
+        // Cursor is after all four graphemes: a, b, é, 日.
+        assert_eq!(b.cursor_grapheme(), 4);
         // Display width: a(1)+b(1)+é(1)+日(2) = 5.
         assert_eq!(b.cursor_column(), 5);
     }
@@ -351,9 +351,9 @@ mod tests {
     fn delete_back_removes_grapheme_not_byte() {
         let mut b = TextBuffer::single_line();
         b.insert("é日");
-        b.move_left(); // before 日
-        b.delete_back(); // removes 日
-        assert_eq!(b.text(), "é");
+        b.move_left(); // cursor is before 日, after é
+        b.delete_back(); // removes the grapheme before the cursor: é
+        assert_eq!(b.text(), "日");
     }
 
     #[test]

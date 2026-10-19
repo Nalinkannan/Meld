@@ -7,6 +7,15 @@
 
 use crossterm::event::KeyEvent;
 
+/// The kind of background operation a result belongs to, so the app can route
+/// it (e.g. pop back to the connections screen on a successful connect).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundKind {
+    Connect,
+    Disconnect,
+    Other,
+}
+
 /// An event produced by one of the event sources.
 #[derive(Debug)]
 pub enum AppEvent {
@@ -18,8 +27,13 @@ pub enum AppEvent {
     Tick,
     /// A background task has finished. `id` matches a pending request id.
     /// `ok` is true when the task succeeded; `message` carries the result or
-    /// error text.
-    BackgroundResult { id: u64, ok: bool, message: String },
+    /// error text; `kind` classifies the operation for routing.
+    BackgroundResult {
+        id: u64,
+        ok: bool,
+        message: String,
+        kind: BackgroundKind,
+    },
 }
 
 /// Monotonically increasing id for tagging background requests.

@@ -18,6 +18,7 @@ use ratatui::{
 };
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use tracing::debug;
 
 /// Context shared with every screen: the session (behind a mutex so screens
 /// can read real engine state and request background work), plus the event
@@ -263,23 +264,33 @@ impl Default for DashboardScreen {
 
 impl Screen for DashboardScreen {
     fn draw(&self, frame: &mut Frame, area: Rect) {
-        let chunks = Layout::default()
+        // Keep the dashboard useful at both compact and wide terminal sizes.
+        // The connection and commit panels sit side-by-side, instead of
+        // letting the connection panel consume nearly the entire screen.
+        let sections = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),
-                Constraint::Min(0),
-                Constraint::Length(3),
+                Constraint::Length(3), // screen title
+                Constraint::Min(8),    // dashboard panels
+                Constraint::Length(5), // quick actions
             ])
             .split(area);
 
-        let title = Paragraph::new("Dashboard")
-            .style(Styles::header())
-            .alignment(Alignment::Center);
-        frame.render_widget(title, chunks[0]);
+        frame.render_widget(
+            Paragraph::new("MELD  /  Dashboard")
+                .style(Styles::header())
+                .alignment(Alignment::Center),
+            sections[0],
+        );
 
-        let conn_lines = vec![
+        let panels = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
+            .split(sections[1]);
+
+        let connection_lines = vec![
             Line::from(vec![
-                Span::styled("Status: ", Styles::muted()),
+                Span::styled("Status   ", Styles::muted()),
                 Span::styled(
                     &self.connection_status,
                     if self.connection_status == "Connected" {
@@ -290,19 +301,35 @@ impl Screen for DashboardScreen {
                 ),
             ]),
             Line::from(vec![
-                Span::styled("Connection: ", Styles::muted()),
-                Span::styled(&self.connection_masked, Styles::item_normal()),
+                Span::styled("Profile  ", Styles::muted()),
+                Span::styled(
+                    if self.connection_masked.is_empty() {
+                        "Not configured"
+                    } else {
+                        self.connection_masked.as_str()
+                    },
+                    Styles::item_normal(),
+                ),
             ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Press c to manage connections",
+                Styles::item_dim(),
+            )),
         ];
-        let conn = Paragraph::new(conn_lines).block(
-            Block::default()
-                .title(" Connection ")
-                .borders(Borders::ALL)
-                .border_style(Styles::border()),
+        frame.render_widget(
+            Paragraph::new(connection_lines)
+                .block(
+                    Block::default()
+                        .title(" Connection ")
+                        .borders(Borders::ALL)
+                        .border_style(Styles::border()),
+                )
+                .style(Styles::item_normal()),
+            panels[0],
         );
-        frame.render_widget(conn, chunks[1]);
 
-        let items: Vec<ratatui::widgets::ListItem> = self
+        let commit_items: Vec<ratatui::widgets::ListItem> = self
             .recent_commits
             .iter()
             .map(|(hash, msg, author)| {
@@ -315,24 +342,53 @@ impl Screen for DashboardScreen {
                 .into()
             })
             .collect();
-        let list = ratatui::widgets::List::new(if items.is_empty() {
-            vec![
-                Line::from(Span::styled(
-                    "No commits yet — create a snapshot.",
-                    Styles::item_dim(),
-                ))
-                .into(),
-            ]
+        let commit_items = if commit_items.is_empty() {
+            vec![ratatui::widgets::ListItem::new(Line::from(Span::styled(
+                "No snapshots yet. Press s to create your first snapshot.",
+                Styles::item_dim(),
+            )))]
         } else {
-            items
-        })
+            commit_items
+        };
+        frame.render_widget(
+            ratatui::widgets::List::new(commit_items)
+                .block(
+                    Block::default()
+                        .title(" Recent snapshots ")
+                        .borders(Borders::ALL)
+                        .border_style(Styles::border()),
+                )
+                .highlight_style(Styles::selected()),
+            panels[1],
+        );
+
+        let shortcuts = Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(" s ", Styles::key_hint()),
+                Span::styled("Snapshot   ", Styles::item_normal()),
+                Span::styled(" c ", Styles::key_hint()),
+                Span::styled("Connections   ", Styles::item_normal()),
+                Span::styled(" v ", Styles::key_hint()),
+                Span::styled("Verify   ", Styles::item_normal()),
+                Span::styled(" ? ", Styles::key_hint()),
+                Span::styled("Help", Styles::item_normal()),
+            ]),
+            Line::from(Span::styled(
+                self.status_msg.as_str(),
+                if self.status_msg.is_empty() {
+                    Styles::item_dim()
+                } else {
+                    Styles::info()
+                },
+            )),
+        ])
         .block(
             Block::default()
-                .title(" Commits ")
+                .title(" Quick actions ")
                 .borders(Borders::ALL)
                 .border_style(Styles::border()),
         );
-        frame.render_widget(list, chunks[2]);
+        frame.render_widget(shortcuts, sections[2]);
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> KeyResult {
@@ -364,18 +420,46 @@ impl Screen for DashboardScreen {
 
     fn set_context(&mut self, ctx: ScreenContext) {
         self.base.set_context(ctx);
+        self.refresh_connection_state();
     }
 
     fn on_result(&mut self, _id: u64, ok: bool, message: String) {
+        self.refresh_connection_state();
         if ok {
-            self.status_msg = format!("verify ok: {message}");
+            self.status_msg = format!("ok: {message}");
         } else {
-            self.status_msg = format!("verify failed: {message}");
+            self.status_msg = format!("failed: {message}");
         }
     }
 
     fn is_connected(&self) -> bool {
-        self.connection_status == "Connected"
+        self.base
+            .ctx
+            .as_ref()
+            .and_then(|c| c.session.try_lock().ok())
+            .map(|session| session.adapter.is_some())
+            .unwrap_or(self.connection_status == "Connected")
+    }
+}
+
+impl DashboardScreen {
+    /// Refresh connection-derived fields from the live session.
+    fn refresh_connection_state(&mut self) {
+        let Some(ctx) = &self.base.ctx else { return };
+        debug!("DashboardScreen::refresh_connection_state: acquiring session lock");
+        let Ok(session) = ctx.session.lock() else { return };
+        debug!("DashboardScreen::refresh_connection_state: session lock acquired");
+        let connected = session.adapter.is_some();
+        self.connection_status = if connected {
+            "Connected".into()
+        } else {
+            "Disconnected".into()
+        };
+        self.connection_masked = session
+            .connection_name()
+            .map(|n| n.to_string())
+            .unwrap_or_default();
+        debug!(connected, "DashboardScreen::refresh_connection_state: session lock released");
     }
 }
 
@@ -467,18 +551,17 @@ impl Screen for ConnectionsScreen {
             KeyCode::Char('n') => return Ok(Some(ScreenAction::Push(ScreenType::NewConnection))),
             KeyCode::Enter => {
                 if let Some(p) = self.selected_profile() {
-                    if self.connected_profile.as_deref() == Some(&p) {
-                        return Ok(Some(ScreenAction::Disconnect));
-                    }
+                    return Ok(Some(ScreenAction::Connect(p)));
+                }
+            }
+            KeyCode::Char('c') => {
+                if let Some(p) = self.selected_profile() {
                     return Ok(Some(ScreenAction::Connect(p)));
                 }
             }
             KeyCode::Char('d') => {
-                if let Some(p) = self.selected_profile() {
-                    if self.connected_profile.as_deref() == Some(&p) {
-                        return Ok(Some(ScreenAction::Disconnect));
-                    }
-                    return Ok(Some(ScreenAction::Connect(p)));
+                if let Some(_p) = self.selected_profile() {
+                    return Ok(Some(ScreenAction::Disconnect));
                 }
             }
             KeyCode::Char('D') => {
@@ -510,9 +593,11 @@ impl Screen for ConnectionsScreen {
 
     fn set_context(&mut self, _ctx: ScreenContext) {
         self.base.set_context(_ctx);
+        debug!("ConnectionsScreen::set_context: acquiring session lock");
         let Some(ctx) = &self.base.ctx else { return };
         if let Ok(session) = ctx.session.lock() {
-            let profiles = meld_store::connection_store::list_profiles(session.store.db())
+            debug!("ConnectionsScreen::set_context: session lock acquired");
+            self.profiles = meld_store::connection_store::list_profiles(session.store.db())
                 .unwrap_or_default()
                 .into_iter()
                 .map(|p| ConnectionProfileView {
@@ -521,23 +606,36 @@ impl Screen for ConnectionsScreen {
                     masked_uri: mask_uri(None),
                 })
                 .collect();
-            self.profiles = profiles;
+            self.connected_profile = session.connection_name().map(|n| n.to_string());
+            debug!("ConnectionsScreen::set_context: session lock released");
         }
     }
 
     fn on_result(&mut self, _id: u64, ok: bool, message: String) {
         if ok {
             self.status_msg = format!("connected: {message}");
-            if let Some(p) = self.selected_profile() {
-                self.connected_profile = Some(p);
-            }
         } else {
             self.status_msg = format!("connection error: {message}");
+        }
+        // Refresh the connected profile from the live session rather than the
+        // currently selected row (which may not be the one just connected).
+        if let Some(ctx) = &self.base.ctx {
+            debug!("ConnectionsScreen::on_result: acquiring session lock");
+            if let Ok(session) = ctx.session.lock() {
+                debug!("ConnectionsScreen::on_result: session lock acquired");
+                self.connected_profile = session.connection_name().map(|n| n.to_string());
+                debug!("ConnectionsScreen::on_result: session lock released");
+            }
         }
     }
 
     fn is_connected(&self) -> bool {
-        self.connected_profile.is_some()
+        self.base
+            .ctx
+            .as_ref()
+            .and_then(|c| c.session.try_lock().ok())
+            .map(|session| session.adapter.is_some())
+            .unwrap_or(self.connected_profile.is_some())
     }
 
     fn branch_name(&self) -> Option<String> {
@@ -563,15 +661,38 @@ impl ConnectionsScreen {
 // New connection
 // ===========================================================================
 
+/// Which engine the New Connection form targets.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EngineChoice {
+    Postgres,
+    MongoDb,
+}
+
+impl EngineChoice {
+    fn label(self) -> &'static str {
+        match self {
+            EngineChoice::Postgres => "PostgreSQL",
+            EngineChoice::MongoDb => "MongoDB",
+        }
+    }
+    fn other(self) -> Self {
+        match self {
+            EngineChoice::Postgres => EngineChoice::MongoDb,
+            EngineChoice::MongoDb => EngineChoice::Postgres,
+        }
+    }
+}
+
 pub struct NewConnectionScreen {
     base: BaseScreen,
     name: InputField,
-    engine: InputField,
+    engine: EngineChoice,
     host: InputField,
     port: InputField,
     database: InputField,
     user: InputField,
     password: InputField,
+    uri: InputField,
     focus: usize,
     status_msg: String,
 }
@@ -581,12 +702,13 @@ impl NewConnectionScreen {
         Self {
             base: BaseScreen::new("New Connection"),
             name: InputField::new("name"),
-            engine: InputField::new("engine (postgres|mongodb)"),
+            engine: EngineChoice::Postgres,
             host: InputField::new("host"),
             port: InputField::new("port"),
             database: InputField::new("database"),
             user: InputField::new("user"),
-            password: InputField::new("password"),
+            password: InputField::new("password").with_masked(true),
+            uri: InputField::new("uri (optional)"),
             focus: 0,
             status_msg: String::new(),
         }
@@ -601,49 +723,82 @@ impl Default for NewConnectionScreen {
 
 impl Screen for NewConnectionScreen {
     fn draw(&self, frame: &mut Frame, area: Rect) {
+        let focused = |i: usize| self.focus == i;
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // title
+                Constraint::Length(1), // name
+                Constraint::Length(1), // engine toggle
+                Constraint::Length(1), // host
+                Constraint::Length(1), // port
+                Constraint::Length(1), // database
+                Constraint::Length(1), // user
+                Constraint::Length(1), // password
+                Constraint::Length(1), // uri (optional)
+                Constraint::Min(1),    // spacer
+                Constraint::Length(1), // status message (inside `area`)
+            ])
+            .split(area);
+
+        // Title on its own row: it never overlaps field 0.
         let title = Paragraph::new("New Connection")
             .style(Styles::header())
             .alignment(Alignment::Center);
-        frame.render_widget(title, area);
+        frame.render_widget(title, chunks[0]);
 
-        let fields = [
-            (&self.name, self.focus == 0),
-            (&self.engine, self.focus == 1),
-            (&self.host, self.focus == 2),
-            (&self.port, self.focus == 3),
-            (&self.database, self.focus == 4),
-            (&self.user, self.focus == 5),
-            (&self.password, self.focus == 6),
-        ];
-        let chunks: Vec<Rect> = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3); 7])
-            .split(area)
-            .iter()
-            .cloned()
-            .collect();
-        for i in 0..fields.len() {
-            let (field, focused) = fields[i];
-            let mut f = field.clone();
-            f.set_focused(focused);
-            f.draw(frame, chunks[i]);
+        // Name.
+        {
+            let mut f = self.name.clone();
+            f.set_focused(focused(0));
+            f.draw(frame, chunks[1]);
         }
+        // Engine toggle.
+        self.draw_engine_toggle(frame, chunks[2], focused(1));
+        // Host / port / database / user / password / uri.
+        {
+            let mut f = self.host.clone();
+            f.set_focused(focused(2));
+            f.draw(frame, chunks[3]);
+        }
+        {
+            let mut f = self.port.clone();
+            f.set_focused(focused(3));
+            f.draw(frame, chunks[4]);
+        }
+        {
+            let mut f = self.database.clone();
+            f.set_focused(focused(4));
+            f.draw(frame, chunks[5]);
+        }
+        {
+            let mut f = self.user.clone();
+            f.set_focused(focused(5));
+            f.draw(frame, chunks[6]);
+        }
+        {
+            let mut f = self.password.clone();
+            f.set_focused(focused(6));
+            f.draw(frame, chunks[7]);
+        }
+        {
+            let mut f = self.uri.clone();
+            f.set_focused(focused(7));
+            f.draw(frame, chunks[8]);
+        }
+
+        // Status message drawn on the bottom row of the given `area`, not at
+        // a hardcoded line.
         if !self.status_msg.is_empty() {
             let msg = Paragraph::new(self.status_msg.clone()).style(Styles::danger());
-            let rect = Rect {
-                x: 0,
-                y: 21,
-                width: area.width,
-                height: 1,
-            };
-            frame.render_widget(msg, rect);
+            frame.render_widget(msg, chunks[10]);
         }
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> KeyResult {
         match key.code {
             KeyCode::Tab => {
-                self.focus = (self.focus + 1) % 7;
+                self.focus = (self.focus + 1) % 8;
                 return Ok(None);
             }
             KeyCode::Enter => {
@@ -653,10 +808,17 @@ impl Screen for NewConnectionScreen {
                 self.base.set_next_screen(ScreenType::Connections);
                 return Ok(None);
             }
+            // Cycle the engine while the toggle row is focused.
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if self.focus == 1 => {
+                self.engine = self.engine.other();
+                return Ok(None);
+            }
             _ => {}
         }
-        // Delegate character/navigation editing to the focused field.
-        let _handled = self.field_mut().handle_key(key);
+        // Delegate character/navigation editing to the focused text field.
+        if self.focus != 1 {
+            let _handled = self.field_mut().handle_key(key);
+        }
         Ok(None)
     }
 
@@ -671,6 +833,7 @@ impl Screen for NewConnectionScreen {
     fn key_hints(&self) -> Vec<ratatui::text::Span<'static>> {
         let mut h = Vec::new();
         h.extend(keybinding_span("Tab", "Next field"));
+        h.extend(keybinding_span("←/→/Space", "Cycle engine"));
         h.extend(keybinding_span("Enter", "Connect"));
         h.extend(keybinding_span("Esc", "Back"));
         h
@@ -679,53 +842,157 @@ impl Screen for NewConnectionScreen {
     fn set_context(&mut self, ctx: ScreenContext) {
         self.base.set_context(ctx);
     }
+
+    fn on_result(&mut self, _id: u64, ok: bool, message: String) {
+        if ok {
+            self.status_msg = format!("Connected: {message}");
+        } else {
+            // Show the full error on the form's status line.
+            self.status_msg = message;
+        }
+    }
 }
 
 impl NewConnectionScreen {
+    fn draw_engine_toggle(&self, frame: &mut Frame, area: Rect, focused: bool) {
+        let selected = self.engine.label();
+        let other = self.engine.other().label();
+        let (sel_style, unsel_style) = if focused {
+            (Styles::selected(), Styles::item_normal())
+        } else {
+            (Styles::item_normal(), Styles::item_dim())
+        };
+        let style_selected = if self.engine == EngineChoice::Postgres {
+            sel_style
+        } else {
+            unsel_style
+        };
+        let style_other = if self.engine == EngineChoice::MongoDb {
+            sel_style
+        } else {
+            unsel_style
+        };
+        let text = Line::from(vec![
+            Span::styled("Engine ", Styles::muted()),
+            Span::styled(format!(" [{selected}] "), style_selected),
+            Span::styled("  ", Styles::muted()),
+            Span::styled(format!(" [{other}] "), style_other),
+        ]);
+        let block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(if focused {
+                Styles::border_focus()
+            } else {
+                Styles::border()
+            });
+        let mut para = Paragraph::new(text);
+        if area.height >= 3 {
+            para = para.block(block);
+        }
+        frame.render_widget(para, area);
+    }
+
     fn field_mut(&mut self) -> &mut InputField {
         match self.focus {
             0 => &mut self.name,
-            1 => &mut self.engine,
             2 => &mut self.host,
             3 => &mut self.port,
             4 => &mut self.database,
             5 => &mut self.user,
-            _ => &mut self.password,
+            6 => &mut self.password,
+            _ => &mut self.uri,
         }
     }
 
+    /// Validate the form and build a `ConnectionConfig`. On failure the
+    /// offending field is named in `status_msg` and `None` is returned so the
+    /// form stays on screen.
     fn submit(&mut self) -> KeyResult {
-        let engine = self.engine.value.trim().to_lowercase();
-        let port: u16 = self.port.value.trim().parse().unwrap_or(5432);
-        let config = if engine == "mongodb" {
-            ConnectionConfig::MongoDb(meld_adapter::MongoConfig {
-                name: self.name.value.clone(),
-                uri: None,
-                host: Some(self.host.value.clone()),
-                port: Some(port),
-                database: self.database.value.clone(),
-                username: Some(self.user.value.clone()),
-                password: if self.password.value.is_empty() {
-                    None
-                } else {
-                    Some(self.password.value.clone())
-                },
-                auth_source: None,
-            })
+        self.status_msg = String::new();
+
+        let name = self.name.value.trim().to_string();
+        if name.is_empty() {
+            self.status_msg = "Invalid name: required".into();
+            return Ok(None);
+        }
+
+        let host = self.host.value.trim().to_string();
+        if host.is_empty() {
+            self.status_msg = "Invalid host: required".into();
+            return Ok(None);
+        }
+
+        let port = match self.port.value.trim() {
+            "" => match self.engine {
+                EngineChoice::MongoDb => 27017,
+                EngineChoice::Postgres => 5432,
+            },
+            s => match s.parse::<u16>() {
+                Ok(p) if p > 0 => p,
+                _ => {
+                    self.status_msg = "Invalid port: must be between 1 and 65535".into();
+                    return Ok(None);
+                }
+            },
+        };
+
+        let database = self.database.value.trim().to_string();
+        if database.is_empty() {
+            self.status_msg = "Invalid database: required".into();
+            return Ok(None);
+        }
+
+        let user = self.user.value.trim().to_string();
+        if matches!(self.engine, EngineChoice::Postgres) && user.is_empty() {
+            self.status_msg = "Invalid user: required for PostgreSQL".into();
+            return Ok(None);
+        }
+
+        // Reject duplicate profile names (there is no overwrite flow yet,
+        // so re-saving would silently clobber the existing profile).
+        if let Some(ctx) = &self.base.ctx
+            && let Ok(session) = ctx.session.try_lock()
+            && meld_store::connection_store::get_profile(session.store.db(), &name)
+                .ok()
+                .flatten()
+                .is_some()
+        {
+            self.status_msg = format!("Profile '{name}' already exists");
+            return Ok(None);
+        }
+
+        let password = if self.password.value.is_empty() {
+            None
         } else {
-            ConnectionConfig::PostgreSql(meld_adapter::PostgresConfig {
-                name: self.name.value.clone(),
-                host: self.host.value.clone(),
+            Some(self.password.value.clone())
+        };
+
+        let uri = if self.uri.value.trim().is_empty() {
+            None
+        } else {
+            Some(self.uri.value.trim().to_string())
+        };
+
+        let config = match self.engine {
+            EngineChoice::MongoDb => ConnectionConfig::MongoDb(meld_adapter::MongoConfig {
+                name: name.clone(),
+                uri,
+                host: if host.is_empty() { None } else { Some(host) },
+                port: if port == 0 { None } else { Some(port) },
+                database,
+                username: if user.is_empty() { None } else { Some(user) },
+                password,
+                auth_source: None,
+            }),
+            EngineChoice::Postgres => ConnectionConfig::PostgreSql(meld_adapter::PostgresConfig {
+                name,
+                host,
                 port,
-                user: self.user.value.clone(),
-                password: if self.password.value.is_empty() {
-                    None
-                } else {
-                    Some(self.password.value.clone())
-                },
-                database: self.database.value.clone(),
-                uri: None,
-            })
+                user,
+                password,
+                database,
+                uri,
+            }),
         };
         Ok(Some(ScreenAction::ConnectNew(config)))
     }
@@ -808,9 +1075,11 @@ impl Screen for HistoryScreen {
     fn set_context(&mut self, _ctx: ScreenContext) {
         self.base.set_context(_ctx);
         let Some(ctx) = &self.base.ctx else { return };
+        debug!("HistoryScreen::set_context: acquiring session lock");
         if let Ok(session) = ctx.session.lock()
             && let Ok(hashes) = session.store.list_all_commit_hashes()
         {
+            debug!("HistoryScreen::set_context: session lock acquired");
             let mut commits = Vec::new();
             for h in hashes {
                 if let Ok(c) = session.store.get_commit(&h) {
@@ -1051,9 +1320,11 @@ impl Screen for BranchesScreen {
     fn set_context(&mut self, _ctx: ScreenContext) {
         self.base.set_context(_ctx);
         let Some(ctx) = &self.base.ctx else { return };
+        debug!("BranchesScreen::set_context: acquiring session lock");
         if let Ok(session) = ctx.session.lock()
             && let Ok(branches) = session.store.list_branches()
         {
+            debug!("BranchesScreen::set_context: session lock acquired");
             self.branches = branches;
             self.current = session.current_branch.clone();
         }

@@ -54,12 +54,13 @@ pub fn parse_command(input: &str) -> Result<MeldCommand, String> {
             Ok(MeldCommand::Disconnect)
         }
         "snapshot" | "s" => {
-            let message = rest
-                .first()
-                .ok_or_else(|| "snapshot requires a message".to_string())?;
-            Ok(MeldCommand::Snapshot {
-                message: message.to_string(),
-            })
+            let message = rest.join(" ");
+
+            if message.is_empty() {
+                return Err("snapshot requires a message".to_string());
+            }
+
+            Ok(MeldCommand::Snapshot { message })
         }
         "history" | "hi" => {
             if !rest.is_empty() {
@@ -273,6 +274,7 @@ mod tests {
     #[test]
     fn complete_command_unambiguous() {
         assert_eq!(complete_command("con"), Some("connect ".to_string()));
-        assert_eq!(complete_command("h"), Some("history ".to_string()));
+        // "h" is ambiguous between help and history; use an unambiguous prefix.
+        assert_eq!(complete_command("his"), Some("history ".to_string()));
     }
 }

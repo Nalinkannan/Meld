@@ -77,6 +77,8 @@ pub struct InputField {
     pub value: String,
     pub focused: bool,
     pub cursor_position: usize,
+    /// When true, the value is drawn as bullets instead of plain text.
+    pub masked: bool,
 }
 
 impl InputField {
@@ -86,12 +88,19 @@ impl InputField {
             value: String::new(),
             focused: false,
             cursor_position: 0,
+            masked: false,
         }
     }
 
     pub fn with_value(mut self, value: impl Into<String>) -> Self {
         self.value = value.into();
         self.cursor_position = self.value.len();
+        self
+    }
+
+    /// Mask the drawn value (e.g. for passwords).
+    pub fn with_masked(mut self, masked: bool) -> Self {
+        self.masked = masked;
         self
     }
 
@@ -137,6 +146,15 @@ impl InputField {
         }
     }
 
+    /// The value to draw: bullets when masked, plain text otherwise.
+    fn display_value(&self) -> String {
+        if self.masked {
+            "•".repeat(self.value.chars().count())
+        } else {
+            self.value.clone()
+        }
+    }
+
     pub fn draw(&self, frame: &mut Frame, area: Rect) {
         let style = if self.focused {
             Styles::input_focus()
@@ -145,18 +163,25 @@ impl InputField {
         };
 
         let cursor = if self.focused {
-            format!(
-                "{}_",
-                &self.value[..self.cursor_position.min(self.value.len())]
-            )
+            if self.masked {
+                format!("{}_", self.display_value())
+            } else {
+                format!(
+                    "{}_",
+                    &self.value[..self.cursor_position.min(self.value.len())]
+                )
+            }
         } else {
-            self.value.clone()
+            self.display_value()
         };
 
         let text = format!("{}: {}", self.label, cursor);
-        let para = Paragraph::new(text)
+        let mut para = Paragraph::new(text)
             .style(style)
-            .block(
+            .wrap(Wrap { trim: true });
+        // A bordered block needs at least 3 lines; single-line rows skip it.
+        if area.height >= 3 {
+            para = para.block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(if self.focused {
@@ -164,8 +189,8 @@ impl InputField {
                     } else {
                         crate::theme::Styles::border()
                     }),
-            )
-            .wrap(Wrap { trim: true });
+            );
+        }
         frame.render_widget(para, area);
     }
 }

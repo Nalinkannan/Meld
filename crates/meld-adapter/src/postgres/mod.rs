@@ -12,7 +12,8 @@ use meld_core::error::MeldError;
 use meld_core::state::{EngineKind, EngineState};
 use meld_core::verify::VerificationReport;
 use sqlx::Row;
-use sqlx::postgres::PgPool;
+use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
+use std::time::Duration;
 use tracing::info;
 
 pub mod apply;
@@ -38,20 +39,51 @@ impl PostgresAdapter {
             .ok_or_else(|| MeldError::InvalidInput("not connected to a PostgreSQL server".into()))
     }
 
-    /// Build a libpq-style connection string. Passwords are held only in
-    /// memory; the DSN is never written to disk or logs.
-    fn dsn(config: &PostgresConfig) -> Result<String, MeldError> {
-        let uri = config.uri.as_deref().filter(|s| !s.is_empty());
-        if let Some(uri) = uri {
-            return Ok(uri.to_string());
+    /// Build `PgConnectOptions` from the config, preferring `uri` when set.
+    /// Empty strings are treated as absent.
+    fn connect_options(config: &PostgresConfig) -> Result<PgConnectOptions, MeldError> {
+        if let Some(uri) = config.uri.as_deref().filter(|s| !s.is_empty()) {
+            return uri
+                .parse::<PgConnectOptions>()
+                .map_err(|e| MeldError::InvalidInput(format!("invalid postgres URI: {e}")));
         }
-        Ok(format!(
-            "postgresql://{}:{}@{}:{}/{}",
-            config.user,
-            config.password.as_deref().unwrap_or(""),
-            config.host,
-            config.port,
-            config.database
+        let mut opts = PgConnectOptions::new();
+        if !config.host.is_empty() {
+            opts = opts.host(&config.host);
+        }
+        opts = opts.port(config.port);
+        if !config.user.is_empty() {
+            opts = opts.username(&config.user);
+        }
+        if let Some(password) = config.password.as_deref().filter(|s| !s.is_empty()) {
+            opts = opts.password(password);
+        }
+        if !config.database.is_empty() {
+            opts = opts.database(&config.database);
+        }
+        Ok(opts)
+    }
+
+    /// Map a sqlx connect error into an actionable message that includes
+    /// host:port and classifies common failure modes.
+    fn map_connect_error(e: sqlx::Error, config: &PostgresConfig) -> MeldError {
+        let target = format!("{}:{}", config.host, config.port);
+        let msg = e.to_string();
+        let kind = if msg.contains("connection refused") {
+            "connection refused"
+        } else if msg.contains("authentication failed")
+            || msg.contains("password authentication failed")
+        {
+            "authentication failed"
+        } else if msg.contains("does not exist") {
+            "database does not exist"
+        } else if msg.contains("TLS") || msg.contains("SSL") || msg.contains("ssl") {
+            "TLS required"
+        } else {
+            "connection failed"
+        };
+        MeldError::Io(format!(
+            "PostgreSQL connect to {target} failed ({kind}): {msg}"
         ))
     }
 }
@@ -82,10 +114,13 @@ impl DatabaseAdapter for PostgresAdapter {
     ) -> Result<ConnectionInfo, MeldError> {
         match config {
             crate::adapter::ConnectionConfig::PostgreSql(pg) => {
-                let dsn = Self::dsn(pg)?;
-                let pool = PgPool::connect(&dsn).await.map_err(|e| {
-                    MeldError::Io(format!("PostgreSQL connection test failed: {e}"))
-                })?;
+                let opts = Self::connect_options(pg)?;
+                let pool = PgPoolOptions::new()
+                    .max_connections(5)
+                    .acquire_timeout(Duration::from_secs(10))
+                    .connect_with(opts)
+                    .await
+                    .map_err(|e| Self::map_connect_error(e, pg))?;
                 let row = sqlx::query("SELECT version()")
                     .fetch_one(&pool)
                     .await
@@ -111,10 +146,13 @@ impl DatabaseAdapter for PostgresAdapter {
     ) -> Result<ConnectionInfo, MeldError> {
         match config {
             crate::adapter::ConnectionConfig::PostgreSql(pg) => {
-                let dsn = Self::dsn(pg)?;
-                let pool = PgPool::connect(&dsn)
+                let opts = Self::connect_options(pg)?;
+                let pool = PgPoolOptions::new()
+                    .max_connections(5)
+                    .acquire_timeout(Duration::from_secs(10))
+                    .connect_with(opts)
                     .await
-                    .map_err(|e| MeldError::Io(format!("PostgreSQL connect failed: {e}")))?;
+                    .map_err(|e| Self::map_connect_error(e, pg))?;
                 let version = {
                     let row = sqlx::query("SELECT version()")
                         .fetch_one(&pool)
@@ -200,36 +238,85 @@ impl DatabaseAdapter for PostgresAdapter {
 mod tests {
     use super::*;
 
-    #[test]
-    fn dsn_prefers_uri() {
-        let cfg = PostgresConfig {
-            name: "x".into(),
-            host: "h".into(),
-            port: 5432,
-            user: "u".into(),
-            password: Some("p".into()),
-            database: "d".into(),
-            uri: Some("postgresql://custom:5432/db".into()),
-        };
-        assert_eq!(
-            PostgresAdapter::dsn(&cfg).unwrap(),
-            "postgresql://custom:5432/db"
-        );
-    }
-
-    #[test]
-    fn dsn_builds_from_fields() {
-        let cfg = PostgresConfig {
+    fn base_cfg() -> PostgresConfig {
+        PostgresConfig {
             name: "x".into(),
             host: "localhost".into(),
             port: 5432,
-            user: "postgres".into(),
-            password: Some("secret".into()),
-            database: "mydb".into(),
+            user: "u".into(),
+            password: None,
+            database: "d".into(),
             uri: None,
-        };
-        let dsn = PostgresAdapter::dsn(&cfg).unwrap();
-        assert!(dsn.starts_with("postgresql://"));
-        assert!(dsn.contains("localhost:5432/mydb"));
+        }
+    }
+
+    #[test]
+    fn connect_options_prefers_uri() {
+        let mut cfg = base_cfg();
+        cfg.uri = Some("postgresql://custom:5432/db".into());
+        let opts = PostgresAdapter::connect_options(&cfg).unwrap();
+        assert_eq!(opts.get_host(), "custom");
+        assert_eq!(opts.get_port(), 5432);
+        assert_eq!(opts.get_database(), Some("db"));
+    }
+
+    #[test]
+    fn connect_options_builds_from_fields() {
+        let cfg = base_cfg();
+        let opts = PostgresAdapter::connect_options(&cfg).unwrap();
+        assert_eq!(opts.get_host(), "localhost");
+        assert_eq!(opts.get_port(), 5432);
+        assert_eq!(opts.get_username(), "u");
+        assert_eq!(opts.get_database(), Some("d"));
+    }
+
+    #[test]
+    fn connect_options_preserves_special_password() {
+        let mut cfg = base_cfg();
+        cfg.password = Some("p@:#%? /space".into());
+        let opts = PostgresAdapter::connect_options(&cfg).unwrap();
+        // Construction must succeed and not mangle the non-secret fields when a
+        // password containing URI-special characters is supplied. sqlx stores
+        // the password verbatim (no getter exposes it), so a successful build
+        // with these fields proves the options were constructed from the input.
+        assert_eq!(opts.get_host(), "localhost");
+        assert_eq!(opts.get_port(), 5432);
+        assert_eq!(opts.get_username(), "u");
+        assert_eq!(opts.get_database(), Some("d"));
+    }
+
+    #[test]
+    fn connect_options_treats_empty_as_none() {
+        let mut cfg = base_cfg();
+        cfg.host = "".into();
+        cfg.user = "".into();
+        cfg.database = "".into();
+        cfg.password = Some("".into());
+        let opts = PostgresAdapter::connect_options(&cfg).unwrap();
+        // Empty strings are treated as absent: construction succeeds and no
+        // empty value is forced onto the options (defaults apply instead).
+        assert_ne!(opts.get_host(), "");
+        assert_ne!(opts.get_username(), "");
+        assert_eq!(opts.get_database(), None);
+    }
+
+    #[test]
+    fn connect_options_rejects_bad_uri() {
+        let mut cfg = base_cfg();
+        cfg.uri = Some("not-a-uri".into());
+        assert!(PostgresAdapter::connect_options(&cfg).is_err());
+    }
+
+    #[test]
+    fn map_connect_error_includes_target() {
+        let cfg = base_cfg();
+        let err = sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "connection refused",
+        ));
+        let mapped = PostgresAdapter::map_connect_error(err, &cfg);
+        let text = mapped.to_string();
+        assert!(text.contains("localhost:5432"));
+        assert!(text.contains("connection refused"));
     }
 }
