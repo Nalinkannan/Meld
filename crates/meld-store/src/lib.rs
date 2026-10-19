@@ -13,6 +13,7 @@ pub mod refs;
 pub mod schema;
 
 use chrono::Utc;
+use meld_core::ids::Hash;
 use meld_core::{Commit, CommitHash, MeldError, ObjectHash};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -151,6 +152,11 @@ impl Store {
         &self.config
     }
 
+    /// Return the underlying redb database (for catalog access).
+    pub fn db(&self) -> &redb::Database {
+        &self.db
+    }
+
     /// Store an opaque byte object, returning its BLAKE3 content address.
     pub fn put_object(&self, bytes: &[u8]) -> Result<ObjectHash, MeldError> {
         object_store::put_object(&self.db, bytes)
@@ -174,6 +180,18 @@ impl Store {
     /// Create a branch, failing if it already exists.
     pub fn create_branch(&self, branch: &str, target: &CommitHash) -> Result<(), MeldError> {
         refs::create_branch(&self.db, branch, target)
+    }
+
+    /// Atomically update `branch` (compare-and-swap against `expected`) and
+    /// set HEAD to `target` in a single store transaction, so branch and HEAD
+    /// can never be left inconsistent by a partial update.
+    pub fn compare_and_swap_branch_and_head(
+        &self,
+        branch: &str,
+        expected: Option<&CommitHash>,
+        target: &CommitHash,
+    ) -> Result<(), MeldError> {
+        refs::compare_and_swap_branch_and_head(&self.db, branch, expected, target)
     }
 
     /// Update a branch, failing unless it currently points at `expected`.
@@ -239,6 +257,76 @@ impl Store {
     /// List all commit hashes in the repository.
     pub fn list_all_commit_hashes(&self) -> Result<Vec<CommitHash>, MeldError> {
         commit_store::list_all_commit_hashes(&self.db)
+    }
+
+    /// Key used in the store-meta table for the restore-in-progress marker.
+    const RESTORE_MARKER_KEY: &str = "restore_in_progress";
+
+    /// Record that a restore is in progress, with the safety-snapshot commit
+    /// hash that can be used to recover if the restore fails.
+    pub fn set_restore_marker(&self, safety_snapshot: &CommitHash) -> Result<(), MeldError> {
+        let json = serde_json::to_string(&safety_snapshot.hex())
+            .map_err(|e| MeldError::Serialization(format!("{e}")))?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MeldError::Io(format!("begin write: {e}")))?;
+        {
+            let mut meta = txn
+                .open_table(schema::STORE_META_TABLE)
+                .map_err(|e| MeldError::Io(format!("open meta table: {e}")))?;
+            meta.insert(Self::RESTORE_MARKER_KEY.to_string(), json)
+                .map_err(|e| MeldError::Io(format!("set restore marker: {e}")))?;
+        }
+        txn.commit()
+            .map_err(|e| MeldError::Io(format!("commit restore marker: {e}")))?;
+        Ok(())
+    }
+
+    /// Clear the restore-in-progress marker after a successful restore.
+    pub fn clear_restore_marker(&self) -> Result<(), MeldError> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MeldError::Io(format!("begin write: {e}")))?;
+        {
+            let mut meta = txn
+                .open_table(schema::STORE_META_TABLE)
+                .map_err(|e| MeldError::Io(format!("open meta table: {e}")))?;
+            meta.remove(Self::RESTORE_MARKER_KEY.to_string())
+                .map_err(|e| MeldError::Io(format!("clear restore marker: {e}")))?;
+        }
+        txn.commit()
+            .map_err(|e| MeldError::Io(format!("commit clear restore marker: {e}")))?;
+        Ok(())
+    }
+
+    /// Return the safety-snapshot commit hash if a restore is in progress
+    /// (i.e. a previous restore was interrupted). Returns None if no restore
+    /// is in progress.
+    pub fn get_restore_marker(&self) -> Result<Option<CommitHash>, MeldError> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MeldError::Io(format!("begin read: {e}")))?;
+        let marker = {
+            let meta = txn
+                .open_table(schema::STORE_META_TABLE)
+                .map_err(|e| MeldError::Io(format!("open meta table: {e}")))?;
+            meta.get(&Self::RESTORE_MARKER_KEY.to_string())
+                .map_err(|e| MeldError::Io(format!("get restore marker: {e}")))?
+                .map(|g| g.value())
+        };
+        drop(txn);
+        let Some(hex_json) = marker else {
+            return Ok(None);
+        };
+        let hex: String = serde_json::from_str(&hex_json)
+            .map_err(|e| MeldError::Serialization(format!("{e}")))?;
+        let hash = Hash::from_hex(&hex)
+            .map(CommitHash)
+            .map_err(|e| MeldError::InvalidInput(format!("corrupt restore marker hash: {e}")))?;
+        Ok(Some(hash))
     }
 
     /// Record when this store was last touched (for diagnostics).

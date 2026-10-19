@@ -56,7 +56,10 @@ pub fn integrity_check(db: &redb::Database) -> Result<IntegrityReport, MeldError
         let bytes: Vec<u8> = value.value();
         let actual = ObjectHash(hash_object(&bytes));
         let key_str: String = _key.value();
-        let expected = ObjectHash(Hash::from_hex(&key_str).unwrap());
+        let expected = ObjectHash(
+            Hash::from_hex(&key_str)
+                .map_err(|e| MeldError::Io(format!("corrupt store object key {key_str}: {e}")))?,
+        );
         if actual == expected {
             report.objects_ok += 1;
         } else {
@@ -82,7 +85,10 @@ pub fn integrity_check(db: &redb::Database) -> Result<IntegrityReport, MeldError
         let bytes: Vec<u8> = value.value();
         let actual = CommitHash(hash_commit(&bytes));
         let key_str: String = key.value();
-        let expected = CommitHash(Hash::from_hex(&key_str).unwrap());
+        let expected = CommitHash(
+            Hash::from_hex(&key_str)
+                .map_err(|e| MeldError::Io(format!("corrupt store commit key {key_str}: {e}")))?,
+        );
         if actual == expected {
             report.commits_ok += 1;
             commit_hashes.push(expected.hex());
@@ -104,7 +110,10 @@ pub fn integrity_check(db: &redb::Database) -> Result<IntegrityReport, MeldError
         .get(&HEAD_KEY.to_string())
         .map_err(|e| MeldError::Io(format!("get head: {e}")))?
     {
-        let head_hash = CommitHash(Hash::from_hex(guard.value().as_str()).unwrap());
+        let head_hash = CommitHash(
+            Hash::from_hex(guard.value().as_str())
+                .map_err(|e| MeldError::Io(format!("corrupt HEAD hash: {e}")))?,
+        );
         if !commit_hashes.contains(&head_hash.hex()) {
             report.head_dangling = true;
         }

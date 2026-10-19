@@ -74,25 +74,16 @@ pub async fn snapshot(
         .put_commit(&commit)
         .map_err(|e| EngineError::Snapshot(e.to_string()))?;
 
-    // 6. Advance the current branch and HEAD atomically.
+    // 6. Advance the current branch and HEAD atomically in a single store
+    //    transaction: a failure leaves neither reference changed.
     let branch = session.current_branch.clone();
     let old_head = session
         .store
         .get_branch(&branch)
         .map_err(|e| EngineError::Snapshot(e.to_string()))?;
-    match old_head {
-        Some(h) => session
-            .store
-            .update_branch(&branch, &h, &commit.hash)
-            .map_err(|e| EngineError::Snapshot(e.to_string()))?,
-        None => session
-            .store
-            .create_branch(&branch, &commit.hash)
-            .map_err(|e| EngineError::Snapshot(e.to_string()))?,
-    }
     session
         .store
-        .set_head(&commit.hash)
+        .compare_and_swap_branch_and_head(&branch, old_head.as_ref(), &commit.hash)
         .map_err(|e| EngineError::Snapshot(e.to_string()))?;
 
     let commit_hash = commit.hash;

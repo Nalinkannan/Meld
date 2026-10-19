@@ -5,12 +5,14 @@
 
 use crate::canonical::hash_state;
 use crate::error::MeldError;
-use crate::identity::{ObjectIdentity, PostgresObjectId};
+use crate::identity::{MongoObjectId, ObjectIdentity, PostgresObjectId};
 use crate::ids::ObjectHash;
 use crate::state::{
-    CanonicalValue, CaptureInfo, EngineKind, EngineState, PgColumn, PgConstraint, PgIndex, PgTable,
+    CanonicalValue, CaptureInfo, EngineKind, EngineState, MongoCollectionState, MongoDocument,
+    MongoIndex, MongoView, PgColumn, PgConstraint, PgIndex, PgTable,
 };
 use crate::transition::{ChangeKind, ChangeOp, ChangeSummary};
+use indexmap::IndexMap;
 
 /// The result of diffing two snapshots.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -320,10 +322,84 @@ fn diff_table(from: &PgTable, to: &PgTable) -> Result<Vec<ChangeOp>, MeldError> 
     Ok(ops)
 }
 
-fn diff_rows(_from: &PgTable, _to: &PgTable) -> Result<Vec<ChangeOp>, MeldError> {
-    // Row-level diffing is delegated to the adapter/engine layer against live
-    // state; the core keeps the structural diff here.
-    Ok(vec![])
+fn diff_rows(from: &PgTable, to: &PgTable) -> Result<Vec<ChangeOp>, MeldError> {
+    let mut ops: Vec<ChangeOp> = vec![];
+
+    let mut from_by_id: std::collections::HashMap<
+        &crate::state::PgRowIdentity,
+        &crate::state::PgRow,
+    > = std::collections::HashMap::new();
+    for row in &from.rows {
+        from_by_id.insert(&row.identity, row);
+    }
+    let mut to_by_id: std::collections::HashMap<
+        &crate::state::PgRowIdentity,
+        &crate::state::PgRow,
+    > = std::collections::HashMap::new();
+    for row in &to.rows {
+        to_by_id.insert(&row.identity, row);
+    }
+
+    let object = |schema: &str, table: &str| {
+        ObjectIdentity::PostgreSql(PostgresObjectId::Table {
+            schema: schema.to_string(),
+            table: table.to_string(),
+        })
+    };
+
+    let mut matched: std::collections::HashSet<crate::state::PgRowIdentity> =
+        std::collections::HashSet::new();
+
+    for identity in to_by_id.keys() {
+        let identity = (*identity).clone();
+        match from_by_id.get(&identity) {
+            Some(from_row) => {
+                matched.insert(identity.clone());
+                let to_row = to_by_id[&identity];
+                if from_row.values != to_row.values {
+                    ops.push(ChangeOp {
+                        kind: ChangeKind::UpdateRow,
+                        object: object(from.schema.as_str(), from.name.as_str()),
+                        field: None,
+                        confidence: 1000,
+                        before: Some(CanonicalValue::Document(from_row.values.clone())),
+                        after: Some(CanonicalValue::Document(to_row.values.clone())),
+                        reason: format!("row updated in {}.{}", from.schema, from.name),
+                    });
+                }
+            }
+            None => {
+                ops.push(ChangeOp {
+                    kind: ChangeKind::InsertRow,
+                    object: object(from.schema.as_str(), from.name.as_str()),
+                    field: None,
+                    confidence: 1000,
+                    before: None,
+                    after: Some(CanonicalValue::Document(to_by_id[&identity].values.clone())),
+                    reason: format!("row inserted into {}.{}", from.schema, from.name),
+                });
+            }
+        }
+    }
+
+    for identity in from_by_id.keys() {
+        let identity = (*identity).clone();
+        if !matched.contains(&identity) {
+            ops.push(ChangeOp {
+                kind: ChangeKind::DeleteRow,
+                object: object(from.schema.as_str(), from.name.as_str()),
+                field: None,
+                confidence: 1000,
+                before: Some(CanonicalValue::Document(
+                    from_by_id[&identity].values.clone(),
+                )),
+                after: None,
+                reason: format!("row deleted from {}.{}", from.schema, from.name),
+            });
+        }
+    }
+
+    Ok(ops)
 }
 
 fn alter_column_op(from: &PgTable, name: &str, fcol: &PgColumn, tcol: &PgColumn) -> ChangeOp {
@@ -503,20 +579,408 @@ fn drop_table(schema: &str, object: PostgresObjectId) -> ChangeOp {
 }
 
 // ---------------------------------------------------------------------------
-// MongoDB diff (stub: real but limited)
+// MongoDB semantic diff
 // ---------------------------------------------------------------------------
 
-fn diff_mongodb(_from: &EngineState, _to: &EngineState) -> Result<Vec<ChangeOp>, MeldError> {
-    // MongoDB diff is implemented in the adapter/engine layer against live
-    // state; here we return no ops to keep the core dependency-free.
-    Ok(vec![])
+fn diff_mongodb(from: &EngineState, to: &EngineState) -> Result<Vec<ChangeOp>, MeldError> {
+    let EngineState::MongoDb(fs) = from else {
+        unreachable!()
+    };
+    let EngineState::MongoDb(ts) = to else {
+        unreachable!()
+    };
+
+    let mut ops: Vec<ChangeOp> = vec![];
+
+    // Collections: existence.
+    for (name, fcoll) in &fs.collections {
+        match ts.collections.get(name) {
+            None => ops.push(drop_collection_op(name)),
+            Some(tcoll) => ops.extend(diff_collection(fcoll, tcoll)?),
+        }
+    }
+    for name in ts.collections.keys() {
+        if !fs.collections.contains_key(name) {
+            ops.push(create_collection_op(name));
+        }
+    }
+
+    Ok(ops)
+}
+
+fn diff_collection(
+    from: &MongoCollectionState,
+    to: &MongoCollectionState,
+) -> Result<Vec<ChangeOp>, MeldError> {
+    let name = &from.name;
+    let mut ops: Vec<ChangeOp> = vec![];
+
+    // Collection options.
+    if from.options != to.options {
+        ops.push(ChangeOp {
+            kind: ChangeKind::AlterCollectionOptions,
+            object: ObjectIdentity::MongoDb(MongoObjectId::Collection { name: name.clone() }),
+            field: None,
+            confidence: 1000,
+            before: Some(CanonicalValue::Text(format!("{:?}", from.options))),
+            after: Some(CanonicalValue::Text(format!("{:?}", to.options))),
+            reason: format!("collection options changed for {name}"),
+        });
+    }
+
+    // Validator.
+    match (&from.validator, &to.validator) {
+        (Some(_), None) => ops.push(drop_validator_op(name)),
+        (None, Some(_)) => ops.push(add_validator_op(name)),
+        (Some(fv), Some(tv)) if fv != tv => ops.push(ChangeOp {
+            kind: ChangeKind::ChangeValidator,
+            object: ObjectIdentity::MongoDb(MongoObjectId::Validator {
+                collection: name.clone(),
+            }),
+            field: None,
+            confidence: 1000,
+            before: Some(CanonicalValue::Text(format!("{:?}", fv.definition))),
+            after: Some(CanonicalValue::Text(format!("{:?}", tv.definition))),
+            reason: format!("validator changed for {name}"),
+        }),
+        _ => {}
+    }
+
+    // Indexes.
+    for (idx_name, fidx) in &from.indexes {
+        if idx_name == "_id_" {
+            continue;
+        }
+        match to.indexes.get(idx_name) {
+            None => ops.push(drop_mongo_index_op(name, idx_name)),
+            Some(tidx) if fidx != tidx => {
+                ops.push(alter_mongo_index_op(name, idx_name, fidx, tidx))
+            }
+            _ => {}
+        }
+    }
+    for idx_name in to.indexes.keys() {
+        if idx_name == "_id_" {
+            continue;
+        }
+        if !from.indexes.contains_key(idx_name) {
+            ops.push(create_mongo_index_op(name, idx_name));
+        }
+    }
+
+    // Views.
+    let fviews: IndexMap<&str, &MongoView> =
+        from.views.iter().map(|v| (v.name.as_str(), v)).collect();
+    let tviews: IndexMap<&str, &MongoView> =
+        to.views.iter().map(|v| (v.name.as_str(), v)).collect();
+    for (vname, fview) in &fviews {
+        match tviews.get(*vname) {
+            None => ops.push(drop_view_op(vname)),
+            Some(tview) if fview != tview => ops.push(alter_view_op(vname, fview, tview)),
+            _ => {}
+        }
+    }
+    for vname in tviews.keys() {
+        if !fviews.contains_key(*vname) {
+            ops.push(create_view_op(vname));
+        }
+    }
+
+    // Documents: diff by _id, preserving BSON type distinctions.
+    ops.extend(diff_documents(from, to)?);
+
+    Ok(ops)
+}
+
+fn diff_documents(
+    from: &MongoCollectionState,
+    to: &MongoCollectionState,
+) -> Result<Vec<ChangeOp>, MeldError> {
+    let mut ops: Vec<ChangeOp> = vec![];
+
+    let mut from_by_id: std::collections::HashMap<&CanonicalValue, &MongoDocument> =
+        std::collections::HashMap::new();
+    for doc in &from.documents {
+        from_by_id.insert(&doc.id, doc);
+    }
+    let mut to_by_id: std::collections::HashMap<&CanonicalValue, &MongoDocument> =
+        std::collections::HashMap::new();
+    for doc in &to.documents {
+        to_by_id.insert(&doc.id, doc);
+    }
+
+    let mut matched: std::collections::HashSet<CanonicalValue> = std::collections::HashSet::new();
+
+    for id in to_by_id.keys() {
+        let id = (*id).clone();
+        match from_by_id.get(&id) {
+            Some(fdoc) => {
+                matched.insert(id.clone());
+                let tdoc = to_by_id[&id];
+                if fdoc.fields != tdoc.fields {
+                    ops.extend(doc_field_changes(from.name.as_str(), &id, fdoc, tdoc)?);
+                }
+            }
+            None => {
+                let tdoc = to_by_id[&id];
+                ops.push(insert_document_op(from.name.as_str(), &id, tdoc));
+            }
+        }
+    }
+
+    for id in from_by_id.keys() {
+        let id = (*id).clone();
+        if !matched.contains(&id) {
+            ops.push(delete_document_op(from.name.as_str(), &id));
+        }
+    }
+
+    Ok(ops)
+}
+
+/// Field-level changes between two versions of the same document. Nested
+/// documents and arrays are compared by value; a type change (e.g. string
+/// `_id` versus ObjectId `_id`) is already prevented by identity matching on
+/// typed `CanonicalValue`.
+fn doc_field_changes(
+    collection: &str,
+    id: &CanonicalValue,
+    from: &MongoDocument,
+    to: &MongoDocument,
+) -> Result<Vec<ChangeOp>, MeldError> {
+    let mut ops: Vec<ChangeOp> = vec![];
+
+    for (field, fval) in &from.fields {
+        match to.fields.get(field) {
+            None => ops.push(remove_field_op(collection, id, field, fval)),
+            Some(tval) if fval != tval => {
+                ops.push(update_field_op(collection, id, field, fval, tval))
+            }
+            _ => {}
+        }
+    }
+    for field in to.fields.keys() {
+        if !from.fields.contains_key(field) {
+            ops.push(add_field_op(
+                collection,
+                id,
+                field,
+                to.fields.get(field).unwrap(),
+            ));
+        }
+    }
+
+    Ok(ops)
+}
+
+// --- op constructors ---
+
+fn create_collection_op(name: &str) -> ChangeOp {
+    ChangeOp::new(
+        ChangeKind::CreateCollection,
+        ObjectIdentity::MongoDb(MongoObjectId::Collection {
+            name: name.to_string(),
+        }),
+        format!("collection {name} created"),
+    )
+}
+
+fn drop_collection_op(name: &str) -> ChangeOp {
+    ChangeOp::new(
+        ChangeKind::DropCollection,
+        ObjectIdentity::MongoDb(MongoObjectId::Collection {
+            name: name.to_string(),
+        }),
+        format!("collection {name} dropped"),
+    )
+}
+
+fn add_validator_op(name: &str) -> ChangeOp {
+    ChangeOp::new(
+        ChangeKind::ChangeValidator,
+        ObjectIdentity::MongoDb(MongoObjectId::Validator {
+            collection: name.to_string(),
+        }),
+        format!("validator added to {name}"),
+    )
+}
+
+fn drop_validator_op(name: &str) -> ChangeOp {
+    ChangeOp::new(
+        ChangeKind::ChangeValidator,
+        ObjectIdentity::MongoDb(MongoObjectId::Validator {
+            collection: name.to_string(),
+        }),
+        format!("validator removed from {name}"),
+    )
+}
+
+fn create_mongo_index_op(collection: &str, index: &str) -> ChangeOp {
+    ChangeOp::new(
+        ChangeKind::CreateMongoIndex,
+        ObjectIdentity::MongoDb(MongoObjectId::Index {
+            collection: collection.to_string(),
+            index: index.to_string(),
+        }),
+        format!("index {index} created on {collection}"),
+    )
+}
+
+fn drop_mongo_index_op(collection: &str, index: &str) -> ChangeOp {
+    ChangeOp::new(
+        ChangeKind::DropMongoIndex,
+        ObjectIdentity::MongoDb(MongoObjectId::Index {
+            collection: collection.to_string(),
+            index: index.to_string(),
+        }),
+        format!("index {index} dropped on {collection}"),
+    )
+}
+
+fn alter_mongo_index_op(
+    collection: &str,
+    index: &str,
+    from: &MongoIndex,
+    to: &MongoIndex,
+) -> ChangeOp {
+    ChangeOp {
+        kind: ChangeKind::AlterMongoIndex,
+        object: ObjectIdentity::MongoDb(MongoObjectId::Index {
+            collection: collection.to_string(),
+            index: index.to_string(),
+        }),
+        field: None,
+        confidence: 1000,
+        before: Some(CanonicalValue::Text(format!("{:?}", from))),
+        after: Some(CanonicalValue::Text(format!("{:?}", to))),
+        reason: format!("index {index} altered on {collection}"),
+    }
+}
+
+fn create_view_op(name: &str) -> ChangeOp {
+    ChangeOp::new(
+        ChangeKind::CreateView,
+        ObjectIdentity::MongoDb(MongoObjectId::View {
+            name: name.to_string(),
+        }),
+        format!("view {name} created"),
+    )
+}
+
+fn drop_view_op(name: &str) -> ChangeOp {
+    ChangeOp::new(
+        ChangeKind::DropView,
+        ObjectIdentity::MongoDb(MongoObjectId::View {
+            name: name.to_string(),
+        }),
+        format!("view {name} dropped"),
+    )
+}
+
+fn alter_view_op(name: &str, from: &MongoView, to: &MongoView) -> ChangeOp {
+    ChangeOp {
+        kind: ChangeKind::AlterView,
+        object: ObjectIdentity::MongoDb(MongoObjectId::View {
+            name: name.to_string(),
+        }),
+        field: None,
+        confidence: 1000,
+        before: Some(CanonicalValue::Text(format!("{:?}", from))),
+        after: Some(CanonicalValue::Text(format!("{:?}", to))),
+        reason: format!("view {name} altered"),
+    }
+}
+
+fn insert_document_op(collection: &str, id: &CanonicalValue, _doc: &MongoDocument) -> ChangeOp {
+    ChangeOp::new(
+        ChangeKind::InsertDocument,
+        ObjectIdentity::MongoDb(MongoObjectId::Document {
+            collection: collection.to_string(),
+            id: id.clone(),
+        }),
+        format!("document inserted into {collection}"),
+    )
+}
+
+fn delete_document_op(collection: &str, id: &CanonicalValue) -> ChangeOp {
+    ChangeOp::new(
+        ChangeKind::DeleteDocument,
+        ObjectIdentity::MongoDb(MongoObjectId::Document {
+            collection: collection.to_string(),
+            id: id.clone(),
+        }),
+        format!("document deleted from {collection}"),
+    )
+}
+
+fn update_field_op(
+    collection: &str,
+    id: &CanonicalValue,
+    field: &str,
+    from: &CanonicalValue,
+    to: &CanonicalValue,
+) -> ChangeOp {
+    ChangeOp {
+        kind: ChangeKind::UpdateDocument,
+        object: ObjectIdentity::MongoDb(MongoObjectId::Document {
+            collection: collection.to_string(),
+            id: id.clone(),
+        }),
+        field: Some(field.to_string()),
+        confidence: 1000,
+        before: Some(from.clone()),
+        after: Some(to.clone()),
+        reason: format!("field {field} changed in document in {collection}"),
+    }
+}
+
+fn add_field_op(
+    collection: &str,
+    id: &CanonicalValue,
+    field: &str,
+    value: &CanonicalValue,
+) -> ChangeOp {
+    ChangeOp {
+        kind: ChangeKind::UpdateDocument,
+        object: ObjectIdentity::MongoDb(MongoObjectId::Document {
+            collection: collection.to_string(),
+            id: id.clone(),
+        }),
+        field: Some(field.to_string()),
+        confidence: 1000,
+        before: None,
+        after: Some(value.clone()),
+        reason: format!("field {field} added to document in {collection}"),
+    }
+}
+
+fn remove_field_op(
+    collection: &str,
+    id: &CanonicalValue,
+    field: &str,
+    value: &CanonicalValue,
+) -> ChangeOp {
+    ChangeOp {
+        kind: ChangeKind::UpdateDocument,
+        object: ObjectIdentity::MongoDb(MongoObjectId::Document {
+            collection: collection.to_string(),
+            id: id.clone(),
+        }),
+        field: Some(field.to_string()),
+        confidence: 1000,
+        before: Some(value.clone()),
+        after: None,
+        reason: format!("field {field} removed from document in {collection}"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::CaptureInfo;
-    use crate::state::{ConsistencyLevel, PgColumn, PgDatabase, PgSchema, PostgresState};
+    use crate::state::{
+        CaptureInfo, CollectionOptions, ConsistencyLevel, PgColumn, PgDatabase, PgSchema,
+        PostgresState,
+    };
     use chrono::Utc;
     use indexmap::IndexMap;
 
@@ -657,5 +1121,320 @@ mod tests {
             row_count: 0,
             rows: vec![],
         }
+    }
+
+    // ----- MongoDB state helpers -----
+
+    fn mongo_id_bytes(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    fn mongo_state(collections: IndexMap<String, MongoCollectionState>) -> EngineState {
+        EngineState::MongoDb(crate::state::MongoState {
+            engine_version: "8.0".into(),
+            database_name: "mydb".into(),
+            collections,
+            warnings: vec![],
+            capture_info: crate::state::CaptureInfo {
+                consistency: ConsistencyLevel::Snapshot,
+                strategy: "test".into(),
+                captured_at: Utc::now(),
+                engine_version: "8.0".into(),
+                scope: "mydb".into(),
+                warnings: vec![],
+            },
+        })
+    }
+
+    fn collection_state(name: &str, documents: Vec<MongoDocument>) -> MongoCollectionState {
+        let count = documents.len() as u64;
+        MongoCollectionState {
+            name: name.to_string(),
+            options: CollectionOptions::default(),
+            validator: None,
+            indexes: IndexMap::new(),
+            views: vec![],
+            documents,
+            document_count: count,
+        }
+    }
+
+    fn doc(id: CanonicalValue, fields: Vec<(&str, CanonicalValue)>) -> MongoDocument {
+        MongoDocument {
+            id,
+            fields: fields
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn mongodb_inserted_document_produces_insert_op() {
+        let before = mongo_state(IndexMap::from([(
+            "users".into(),
+            collection_state("users", vec![]),
+        )]));
+        let mut after = mongo_state(IndexMap::from([(
+            "users".into(),
+            collection_state(
+                "users",
+                vec![doc(
+                    CanonicalValue::ObjectId(mongo_id_bytes("507f1f77bcf86cd799439011")),
+                    vec![("name", CanonicalValue::Text("ada".into()))],
+                )],
+            ),
+        )]));
+        if let EngineState::MongoDb(s) = &mut after {
+            s.collections.get_mut("users").unwrap().document_count = 1;
+        }
+        let diff = diff_states(&before, &after).unwrap();
+        assert!(
+            diff.ops
+                .iter()
+                .any(|o| matches!(o.kind, ChangeKind::InsertDocument)),
+            "expected InsertDocument, got {:?}",
+            diff.ops
+        );
+    }
+
+    #[test]
+    fn mongodb_deleted_document_produces_delete_op() {
+        let before = mongo_state(IndexMap::from([(
+            "users".into(),
+            collection_state(
+                "users",
+                vec![doc(
+                    CanonicalValue::ObjectId(mongo_id_bytes("507f1f77bcf86cd799439011")),
+                    vec![("name", CanonicalValue::Text("ada".into()))],
+                )],
+            ),
+        )]));
+        let after = mongo_state(IndexMap::from([(
+            "users".into(),
+            collection_state("users", vec![]),
+        )]));
+        let diff = diff_states(&before, &after).unwrap();
+        assert!(
+            diff.ops
+                .iter()
+                .any(|o| matches!(o.kind, ChangeKind::DeleteDocument)),
+            "expected DeleteDocument, got {:?}",
+            diff.ops
+        );
+    }
+
+    #[test]
+    fn mongodb_updated_field_produces_update_op() {
+        let before = mongo_state(IndexMap::from([(
+            "users".into(),
+            collection_state(
+                "users",
+                vec![doc(
+                    CanonicalValue::ObjectId(mongo_id_bytes("507f1f77bcf86cd799439011")),
+                    vec![("name", CanonicalValue::Text("ada".into()))],
+                )],
+            ),
+        )]));
+        let mut after = mongo_state(IndexMap::from([(
+            "users".into(),
+            collection_state(
+                "users",
+                vec![doc(
+                    CanonicalValue::ObjectId(mongo_id_bytes("507f1f77bcf86cd799439011")),
+                    vec![("name", CanonicalValue::Text("ada lovelace".into()))],
+                )],
+            ),
+        )]));
+        if let EngineState::MongoDb(s) = &mut after {
+            s.collections.get_mut("users").unwrap().document_count = 1;
+        }
+        let diff = diff_states(&before, &after).unwrap();
+        assert!(
+            diff.ops.iter().any(|o| {
+                matches!(o.kind, ChangeKind::UpdateDocument) && o.field.as_deref() == Some("name")
+            }),
+            "expected UpdateDocument on field name, got {:?}",
+            diff.ops
+        );
+    }
+
+    #[test]
+    fn mongodb_string_and_objectid_ids_are_distinct() {
+        let str_id = CanonicalValue::Text("507f1f77bcf86cd799439011".into());
+        let oid = CanonicalValue::ObjectId(mongo_id_bytes("507f1f77bcf86cd799439011"));
+        assert_ne!(str_id, oid);
+
+        let before = mongo_state(IndexMap::from([(
+            "users".into(),
+            collection_state("users", vec![doc(str_id, vec![])]),
+        )]));
+        let after = mongo_state(IndexMap::from([(
+            "users".into(),
+            collection_state("users", vec![doc(oid.clone(), vec![])]),
+        )]));
+        let diff = diff_states(&before, &after).unwrap();
+        // A string _id replaced by an ObjectId _id is a delete + insert, not an
+        // in-place update of the same identity.
+        let has_delete = diff
+            .ops
+            .iter()
+            .any(|o| matches!(o.kind, ChangeKind::DeleteDocument));
+        let has_insert = diff
+            .ops
+            .iter()
+            .any(|o| matches!(o.kind, ChangeKind::InsertDocument));
+        assert!(has_delete && has_insert);
+    }
+
+    #[test]
+    fn mongodb_nested_document_change_detected() {
+        let before = mongo_state(IndexMap::from([(
+            "users".into(),
+            collection_state(
+                "users",
+                vec![doc(
+                    CanonicalValue::ObjectId(mongo_id_bytes("507f1f77bcf86cd799439011")),
+                    vec![(
+                        "address",
+                        CanonicalValue::Document(IndexMap::from([(
+                            "city".into(),
+                            CanonicalValue::Text("Paris".into()),
+                        )])),
+                    )],
+                )],
+            ),
+        )]));
+        let mut after = mongo_state(IndexMap::from([(
+            "users".into(),
+            collection_state(
+                "users",
+                vec![doc(
+                    CanonicalValue::ObjectId(mongo_id_bytes("507f1f77bcf86cd799439011")),
+                    vec![(
+                        "address",
+                        CanonicalValue::Document(IndexMap::from([(
+                            "city".into(),
+                            CanonicalValue::Text("Lyon".into()),
+                        )])),
+                    )],
+                )],
+            ),
+        )]));
+        if let EngineState::MongoDb(s) = &mut after {
+            s.collections.get_mut("users").unwrap().document_count = 1;
+        }
+        let diff = diff_states(&before, &after).unwrap();
+        assert!(
+            diff.ops.iter().any(|o| {
+                matches!(o.kind, ChangeKind::UpdateDocument)
+                    && o.field.as_deref() == Some("address")
+            }),
+            "expected nested document change, got {:?}",
+            diff.ops
+        );
+    }
+
+    #[test]
+    fn mongodb_index_change_detected() {
+        let mut indexes = IndexMap::new();
+        indexes.insert(
+            "name_1".into(),
+            MongoIndex {
+                name: "name_1".into(),
+                keys: vec![("name".into(), 1)],
+                unique: false,
+                partial_filter: None,
+                ttl: None,
+                sparse: None,
+                background: None,
+            },
+        );
+        let before = mongo_state(IndexMap::from([(
+            "users".into(),
+            MongoCollectionState {
+                name: "users".into(),
+                options: CollectionOptions::default(),
+                validator: None,
+                indexes,
+                views: vec![],
+                documents: vec![],
+                document_count: 0,
+            },
+        )]));
+        let after = mongo_state(IndexMap::from([(
+            "users".into(),
+            MongoCollectionState {
+                name: "users".into(),
+                options: CollectionOptions::default(),
+                validator: None,
+                indexes: IndexMap::new(),
+                views: vec![],
+                documents: vec![],
+                document_count: 0,
+            },
+        )]));
+        let diff = diff_states(&before, &after).unwrap();
+        assert!(
+            diff.ops
+                .iter()
+                .any(|o| matches!(o.kind, ChangeKind::DropMongoIndex)),
+            "expected DropMongoIndex, got {:?}",
+            diff.ops
+        );
+    }
+
+    #[test]
+    fn mongodb_collection_created_and_dropped() {
+        let before = mongo_state(IndexMap::new());
+        let after = mongo_state(IndexMap::from([(
+            "orders".into(),
+            MongoCollectionState {
+                name: "orders".into(),
+                options: CollectionOptions::default(),
+                validator: None,
+                indexes: IndexMap::new(),
+                views: vec![],
+                documents: vec![],
+                document_count: 0,
+            },
+        )]));
+        let diff = diff_states(&before, &after).unwrap();
+        assert!(
+            diff.ops
+                .iter()
+                .any(|o| matches!(o.kind, ChangeKind::CreateCollection)),
+            "expected CreateCollection, got {:?}",
+            diff.ops
+        );
+
+        let diff = diff_states(&after, &before).unwrap();
+        assert!(
+            diff.ops
+                .iter()
+                .any(|o| matches!(o.kind, ChangeKind::DropCollection)),
+            "expected DropCollection, got {:?}",
+            diff.ops
+        );
+    }
+
+    #[test]
+    fn mongodb_identical_states_empty_diff() {
+        let s = mongo_state(IndexMap::from([(
+            "users".into(),
+            collection_state("users", vec![]),
+        )]));
+        let diff = diff_states(
+            &s,
+            &mongo_state(IndexMap::from([(
+                "users".into(),
+                collection_state("users", vec![]),
+            )])),
+        )
+        .unwrap();
+        assert!(diff.is_empty());
     }
 }

@@ -21,7 +21,8 @@ use indexmap::IndexMap;
 
 /// Current canonical format version. Increment whenever the canonical byte
 /// format changes in a non-backward-compatible way.
-pub const CANONICAL_FORMAT_VERSION: u32 = 1;
+/// Bumped to 2 for the lossless BSON canonical value encoding (C3).
+pub const CANONICAL_FORMAT_VERSION: u32 = 2;
 
 /// Domain separation prefixes so that hashes for different purposes never
 /// collide even if the byte inputs are identical.

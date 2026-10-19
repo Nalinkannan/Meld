@@ -1,8 +1,8 @@
 //! Three-way merge orchestration.
 
 use crate::error::EngineError;
+use crate::session::Session;
 use meld_core::ids::CommitHash;
-use meld_core::merge::{MergeInput as CoreMergeInput, analyze_merge as core_analyze_merge};
 
 /// Input to a three-way merge.
 pub struct MergeInput {
@@ -60,7 +60,7 @@ pub async fn analyze_merge(
     }
 
     // Perform merge analysis using the core domain logic.
-    let core_input = CoreMergeInput {
+    let core_input = meld_core::merge::MergeInput {
         ancestor: input.ancestor,
         left: input.left,
         right: input.right,
@@ -69,7 +69,7 @@ pub async fn analyze_merge(
         right_state: right_commit.state.clone(),
     };
 
-    let analysis = core_analyze_merge(&core_input);
+    let analysis = meld_core::merge::analyze_merge(&core_input);
 
     Ok(MergeAnalysis {
         ancestor: analysis.ancestor,
@@ -86,6 +86,14 @@ pub async fn analyze_merge(
 /// Check if all conflicts in an analysis have been resolved.
 pub fn all_conflicts_resolved(analysis: &MergeAnalysis) -> bool {
     analysis.conflicts.iter().all(|c| c.is_resolved())
+}
+
+/// Returns the resolution strategies the engine can apply for a conflict, so
+/// the UI only offers choices that `apply_resolution` will honour.
+pub fn supported_resolutions(
+    conflict: &meld_core::conflict::Conflict,
+) -> Vec<meld_core::conflict::ConflictResolution> {
+    meld_core::merge::supported_resolutions(conflict)
 }
 
 /// Get a summary of the merge analysis.
@@ -113,6 +121,95 @@ pub struct MergeSummary {
     pub resolved_conflicts: usize,
     pub auto_mergeable: usize,
     pub engine_kind: meld_core::state::EngineKind,
+}
+
+/// Perform a three-way merge and create a merge commit.
+///
+/// Requires all conflicts to be resolved. Creates a merge commit with two
+/// parents (left and right) and the proposed merged state, persists it, and
+/// advances HEAD to the merge commit.
+pub async fn perform_merge(
+    session: &mut Session,
+    input: MergeInput,
+    author: &str,
+    message: &str,
+) -> Result<CommitHash, EngineError> {
+    let store = &session.store;
+
+    // Load the three commits.
+    let ancestor_commit = store
+        .get_commit(&input.ancestor)
+        .map_err(|e| EngineError::Merge(format!("failed to load ancestor commit: {e}")))?;
+    let left_commit = store
+        .get_commit(&input.left)
+        .map_err(|e| EngineError::Merge(format!("failed to load left commit: {e}")))?;
+    let right_commit = store
+        .get_commit(&input.right)
+        .map_err(|e| EngineError::Merge(format!("failed to load right commit: {e}")))?;
+
+    // Engine/scope compatibility.
+    if left_commit.state.engine_kind() != ancestor_commit.state.engine_kind()
+        || right_commit.state.engine_kind() != ancestor_commit.state.engine_kind()
+    {
+        return Err(EngineError::IncompatibleEngine {
+            expected: ancestor_commit.state.engine_kind(),
+            got: left_commit.state.engine_kind(),
+        });
+    }
+
+    // Run core merge analysis.
+    let core_input = meld_core::merge::MergeInput {
+        ancestor: input.ancestor,
+        left: input.left,
+        right: input.right,
+        ancestor_state: ancestor_commit.state.clone(),
+        left_state: left_commit.state.clone(),
+        right_state: right_commit.state.clone(),
+    };
+    let analysis = meld_core::merge::analyze_merge(&core_input);
+
+    // All conflicts must be resolved before creating a merge commit.
+    if analysis.conflicts.iter().any(|c| !c.is_resolved()) {
+        return Err(EngineError::Merge(
+            "cannot create merge commit: not all conflicts are resolved".into(),
+        ));
+    }
+
+    // Apply resolutions to produce the proposed merged state.
+    let proposed =
+        meld_core::merge::apply_resolution(&analysis, &left_commit.state, &right_commit.state)
+            .map_err(|e| EngineError::Merge(format!("failed to apply merge resolutions: {e}")))?;
+
+    // Build the merge commit.
+    let root_hash = meld_core::ids::ObjectHash::from_bytes(
+        meld_core::canonical::hash_state(&proposed.state).as_bytes(),
+    );
+    let commit = meld_core::commit::Commit::new(
+        vec![input.left, input.right],
+        author,
+        message,
+        analysis.engine_kind,
+        left_commit.scope.clone(),
+        root_hash,
+        proposed.summary,
+        proposed.state,
+    );
+
+    // Persist the commit.
+    store
+        .put_commit(&commit)
+        .map_err(|e| EngineError::Merge(format!("failed to persist merge commit: {e}")))?;
+
+    // Advance HEAD to the merge commit.
+    let branch = session.current_branch.clone();
+    let old_head = store
+        .get_branch(&branch)
+        .map_err(|e| EngineError::Merge(format!("failed to read branch: {e}")))?;
+    store
+        .compare_and_swap_branch_and_head(&branch, old_head.as_ref(), &commit.hash)
+        .map_err(|e| EngineError::Merge(format!("failed to advance HEAD: {e}")))?;
+
+    Ok(commit.hash)
 }
 
 #[cfg(test)]

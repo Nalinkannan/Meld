@@ -3,6 +3,8 @@
 //! Queries pg_catalog to build a typed `PostgresState`. Schemas other than
 //! `public` are respected.
 
+#![allow(clippy::explicit_auto_deref)]
+
 use chrono::Utc;
 use indexmap::IndexMap;
 use meld_core::error::MeldError;
@@ -15,10 +17,22 @@ use super::extract::extract_table_rows;
 use sqlx::Row;
 use tracing::debug;
 
+/// Introspect the live database inside a single `REPEATABLE READ, READ ONLY`
+/// transaction so that catalog metadata and row data reflect one
+/// point-in-time snapshot.
 pub async fn introspect(pool: &sqlx::PgPool) -> Result<meld_core::state::EngineState, MeldError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| MeldError::Io(format!("begin introspection transaction: {e}")))?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| MeldError::Io(format!("set transaction isolation: {e}")))?;
+
     // Current database only (the one we're connected to).
     let db_name: String = sqlx::query("SELECT current_database()")
-        .fetch_one(pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| MeldError::Io(format!("current_database: {e}")))?
         .try_get("current_database")
@@ -31,10 +45,12 @@ pub async fn introspect(pool: &sqlx::PgPool) -> Result<meld_core::state::EngineS
          WHERE schema_name NOT IN ('pg_catalog','information_schema','pg_toast')
          ORDER BY schema_name",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|e| MeldError::Io(format!("list schemas: {e}")))?;
 
+    let mut db_views = IndexMap::new();
+    let mut db_sequences = IndexMap::new();
     for sr in &schema_rows {
         let schema_name: String = sr.try_get("schema_name").unwrap_or_default();
         let mut tables = IndexMap::new();
@@ -45,7 +61,7 @@ pub async fn introspect(pool: &sqlx::PgPool) -> Result<meld_core::state::EngineS
              ORDER BY table_name",
         )
         .bind(&schema_name)
-        .fetch_all(pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| MeldError::Io(format!("list tables in {schema_name}: {e}")))?;
 
@@ -65,7 +81,7 @@ pub async fn introspect(pool: &sqlx::PgPool) -> Result<meld_core::state::EngineS
             )
             .bind(&schema_name)
             .bind(&table_name)
-            .fetch_all(pool)
+            .fetch_all(&mut *tx)
             .await
             .map_err(|e| MeldError::Io(format!("list columns of {object_identity}: {e}")))?;
 
@@ -112,35 +128,35 @@ pub async fn introspect(pool: &sqlx::PgPool) -> Result<meld_core::state::EngineS
             }
 
             // Primary key constraint.
-            let primary_key = get_primary_key(pool, &schema_name, &table_name)
+            let primary_key = get_primary_key(&mut *tx, &schema_name, &table_name)
                 .await
                 .ok()
                 .flatten();
 
             // Unique constraints.
             let unique_constraints =
-                get_constraints_of_kind(pool, &schema_name, &table_name, "UNIQUE")
+                get_constraints_of_kind(&mut *tx, &schema_name, &table_name, "UNIQUE")
                     .await
                     .unwrap_or_default();
 
             // Foreign keys.
             let foreign_keys =
-                get_constraints_of_kind(pool, &schema_name, &table_name, "FOREIGN KEY")
+                get_constraints_of_kind(&mut *tx, &schema_name, &table_name, "FOREIGN KEY")
                     .await
                     .unwrap_or_default();
 
             // Check constraints.
             let check_constraints =
-                get_constraints_of_kind(pool, &schema_name, &table_name, "CHECK")
+                get_constraints_of_kind(&mut *tx, &schema_name, &table_name, "CHECK")
                     .await
                     .unwrap_or_default();
 
             // Indexes.
-            let indexes = get_indexes(pool, &schema_name, &table_name)
+            let indexes = get_indexes(&mut *tx, &schema_name, &table_name)
                 .await
                 .unwrap_or_default();
 
-            let row_count: u64 = count_rows(pool, &schema_name, &table_name)
+            let row_count: u64 = count_rows(&mut *tx, &schema_name, &table_name)
                 .await
                 .unwrap_or(0);
 
@@ -157,7 +173,7 @@ pub async fn introspect(pool: &sqlx::PgPool) -> Result<meld_core::state::EngineS
                 row_count,
                 rows: vec![],
             };
-            let rows = extract_table_rows(pool, &temp_table, None).await?;
+            let rows = extract_table_rows(&mut tx, &temp_table).await?;
 
             tables.insert(
                 table_name.clone(),
@@ -183,7 +199,7 @@ pub async fn introspect(pool: &sqlx::PgPool) -> Result<meld_core::state::EngineS
              WHERE table_schema = $1 ORDER BY table_name",
         )
         .bind(&schema_name)
-        .fetch_all(pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| MeldError::Io(format!("list views in {schema_name}: {e}")))?;
         for vr in &view_rows {
@@ -207,7 +223,7 @@ pub async fn introspect(pool: &sqlx::PgPool) -> Result<meld_core::state::EngineS
              WHERE sequence_schema = $1 ORDER BY sequence_name",
         )
         .bind(&schema_name)
-        .fetch_all(pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| MeldError::Io(format!("list sequences in {schema_name}: {e}")))?;
         for sr2 in &seq_rows {
@@ -235,37 +251,55 @@ pub async fn introspect(pool: &sqlx::PgPool) -> Result<meld_core::state::EngineS
         schemas.insert(
             schema_name.clone(),
             PgSchema {
-                name: schema_name,
+                name: schema_name.clone(),
                 tables,
             },
         );
-        let _ = views;
-        let _ = sequences;
+        for view in views.values() {
+            db_views.insert(format!("{schema_name}.{}", view.name), view.clone());
+        }
+        for sequence in sequences.values() {
+            db_sequences.insert(format!("{schema_name}.{}", sequence.name), sequence.clone());
+        }
     }
 
+    let engine_version: String = sqlx::query("SHOW server_version")
+        .fetch_one(&mut *tx)
+        .await
+        .and_then(|r| r.try_get::<String, _>("server_version"))
+        .unwrap_or_else(|_| "unknown".into());
+
+    tx.commit()
+        .await
+        .map_err(|e| MeldError::Io(format!("commit introspection transaction: {e}")))?;
+
     let state = PostgresState {
-        engine_version: sqlx::query("SHOW server_version")
-            .fetch_one(pool)
-            .await
-            .and_then(|r| r.try_get::<String, _>("server_version"))
-            .unwrap_or_else(|_| "unknown".into()),
+        engine_version: engine_version.clone(),
         databases: {
             let mut db_map = IndexMap::new();
             let mut schemas_out = IndexMap::new();
             for (name, schema) in schemas {
                 schemas_out.insert(name, schema);
             }
-            db_map.insert(db_name.clone(), PgDatabase { name: db_name.clone(), schemas: schemas_out, views: IndexMap::new(), sequences: IndexMap::new() });
+            db_map.insert(
+                db_name.clone(),
+                PgDatabase {
+                    name: db_name.clone(),
+                    schemas: schemas_out,
+                    views: db_views,
+                    sequences: db_sequences,
+                },
+            );
             db_map
         },
         warnings: vec![],
         capture_info: CaptureInfo {
             consistency: ConsistencyLevel::Snapshot,
-            strategy: "single-statement-per-catalog-query; not transactionally isolated across the whole capture".into(),
+            strategy: "single REPEATABLE READ, READ ONLY transaction for catalog + row data".into(),
             captured_at: Utc::now(),
-            engine_version: "postgresql".into(),
+            engine_version,
             scope: db_name.clone(),
-            warnings: vec!["PostgreSQL snapshot is captured across multiple catalog queries; concurrent writes between queries may make the capture non-transactional.".into()],
+            warnings: vec![],
         },
     };
 
@@ -273,12 +307,12 @@ pub async fn introspect(pool: &sqlx::PgPool) -> Result<meld_core::state::EngineS
 }
 
 async fn get_primary_key(
-    pool: &sqlx::PgPool,
+    exec: &mut sqlx::PgConnection,
     schema: &str,
     table: &str,
 ) -> Result<Option<PgConstraint>, MeldError> {
     let row = sqlx::query(
-        "SELECT conname, pg_get_constraintdef(oid) AS def
+        "SELECT conname, pg_get_constraintdef(pg_constraint.oid) AS def
          FROM pg_constraint
          JOIN pg_class ON pg_class.oid = conrelid
          JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace
@@ -286,11 +320,13 @@ async fn get_primary_key(
     )
     .bind(schema)
     .bind(table)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *exec)
     .await
     .map_err(|e| MeldError::Io(format!("primary key: {e}")))?;
     let pk_columns_vec = match &row {
-        Some(_) => pk_columns(pool, schema, table).await.unwrap_or_default(),
+        Some(_) => pk_columns(&mut *exec, schema, table)
+            .await
+            .unwrap_or_default(),
         None => vec![],
     };
     Ok(row.map(|r| PgConstraint {
@@ -304,7 +340,7 @@ async fn get_primary_key(
 }
 
 async fn pk_columns(
-    pool: &sqlx::PgPool,
+    exec: &mut sqlx::PgConnection,
     schema: &str,
     table: &str,
 ) -> Result<Vec<String>, MeldError> {
@@ -319,7 +355,7 @@ async fn pk_columns(
     )
     .bind(schema)
     .bind(table)
-    .fetch_all(pool)
+    .fetch_all(&mut *exec)
     .await
     .map_err(|e| MeldError::Io(format!("pk columns: {e}")))?;
     Ok(rows
@@ -329,13 +365,13 @@ async fn pk_columns(
 }
 
 async fn get_constraints_of_kind(
-    pool: &sqlx::PgPool,
+    exec: &mut sqlx::PgConnection,
     schema: &str,
     table: &str,
     _kind: &str,
 ) -> Result<Vec<PgConstraint>, MeldError> {
     let rows = sqlx::query(
-        "SELECT conname, contype, pg_get_constraintdef(oid) AS def
+        "SELECT conname, contype, pg_get_constraintdef(pg_constraint.oid) AS def
          FROM pg_constraint
          JOIN pg_class ON pg_class.oid = conrelid
          JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace
@@ -343,7 +379,7 @@ async fn get_constraints_of_kind(
     )
     .bind(schema)
     .bind(table)
-    .fetch_all(pool)
+    .fetch_all(&mut *exec)
     .await
     .map_err(|e| MeldError::Io(format!("constraints: {e}")))?;
 
@@ -370,18 +406,22 @@ async fn get_constraints_of_kind(
 }
 
 async fn get_indexes(
-    pool: &sqlx::PgPool,
+    exec: &mut sqlx::PgConnection,
     schema: &str,
     table: &str,
 ) -> Result<IndexMap<String, PgIndex>, MeldError> {
     let rows = sqlx::query(
-        "SELECT indexname, indexdef, indisunique, indisprimary
-         FROM pg_indexes
-         WHERE schemaname = $1 AND tablename = $2",
+        "SELECT ic.relname AS indexname, pg_get_indexdef(ix.indexrelid) AS indexdef,
+                ix.indisunique, ix.indisprimary
+         FROM pg_index ix
+         JOIN pg_class ic ON ic.oid = ix.indexrelid
+         JOIN pg_class tc ON tc.oid = ix.indrelid
+         JOIN pg_namespace tn ON tn.oid = tc.relnamespace
+         WHERE tn.nspname = $1 AND tc.relname = $2",
     )
     .bind(schema)
     .bind(table)
-    .fetch_all(pool)
+    .fetch_all(&mut *exec)
     .await
     .map_err(|e| MeldError::Io(format!("indexes: {e}")))?;
 
@@ -392,7 +432,7 @@ async fn get_indexes(
         let is_unique: bool = r.try_get::<bool, _>("indisunique").unwrap_or(false);
         let is_primary: bool = r.try_get::<bool, _>("indisprimary").unwrap_or(false);
         // Column names for the index.
-        let columns = index_columns(pool, schema, table, &name)
+        let columns = index_columns(&mut *exec, schema, table, &name)
             .await
             .unwrap_or_default();
         out.insert(
@@ -418,7 +458,7 @@ async fn get_indexes(
 }
 
 async fn index_columns(
-    pool: &sqlx::PgPool,
+    exec: &mut sqlx::PgConnection,
     schema: &str,
     table: &str,
     _index: &str,
@@ -433,7 +473,7 @@ async fn index_columns(
     )
     .bind(schema)
     .bind(table)
-    .fetch_all(pool)
+    .fetch_all(&mut *exec)
     .await
     .map_err(|e| MeldError::Io(format!("index columns: {e}")))?;
     Ok(rows
@@ -442,14 +482,18 @@ async fn index_columns(
         .collect())
 }
 
-async fn count_rows(pool: &sqlx::PgPool, schema: &str, table: &str) -> Result<u64, MeldError> {
+async fn count_rows(
+    exec: &mut sqlx::PgConnection,
+    schema: &str,
+    table: &str,
+) -> Result<u64, MeldError> {
     let q = format!(
         "SELECT count(*) FROM \"{}\".\"{}\"",
         sql_quote(schema),
         sql_quote(table)
     );
     let row = sqlx::query(&q)
-        .fetch_one(pool)
+        .fetch_one(&mut *exec)
         .await
         .map_err(|e| MeldError::Io(format!("count rows {schema}.{table}: {e}")))?;
     Ok(row.try_get::<i64, _>(0).unwrap_or(0) as u64)

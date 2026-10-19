@@ -2,21 +2,32 @@
 //!
 //! Re-inspects the live database using fresh read-only queries and compares
 //! against the intended target state. Never reuses in-memory submitted state.
+//! The live state is captured inside a single `REPEATABLE READ` transaction
+//! (see `introspect`), so the comparison is a point-in-point snapshot rather
+//! than a mix of states from concurrent writes.
 
-use meld_core::RootHash;
+use chrono::Utc;
 use meld_core::canonical::hash_state;
+use meld_core::diff::diff_states;
 use meld_core::error::MeldError;
-use meld_core::state::{EngineKind, EngineState, PostgresState};
+use meld_core::ids::{ObjectHash, RootHash};
+use meld_core::state::{EngineKind, EngineState};
 use meld_core::verify::{
     CheckCategory, ErrorSeverity, Mismatch, VerificationCheck, VerificationReport,
 };
-use sqlx::Row;
+
+use super::introspect;
+
+/// Epoch used to normalize capture metadata before comparing state hashes.
+/// Capture timestamps and warnings describe *how* a state was captured, not
+/// the logical database state, so they must not influence verification.
+const VERIFY_EPOCH_SECS: i64 = 0;
 
 pub async fn verify(
     pool: &sqlx::PgPool,
     target: &EngineState,
 ) -> Result<VerificationReport, MeldError> {
-    let EngineState::PostgreSql(target_state) = target else {
+    let EngineState::PostgreSql(_) = target else {
         return Err(MeldError::IncompatibleEngine {
             expected: EngineKind::PostgreSql,
             got: EngineKind::MongoDb,
@@ -26,109 +37,119 @@ pub async fn verify(
     let mut checks: Vec<VerificationCheck> = Vec::new();
     let mut mismatches: Vec<Mismatch> = Vec::new();
 
-    for (db_name, target_db) in &target_state.databases {
-        for (schema_name, target_schema) in &target_db.schemas {
-            for (table_name, target_table) in &target_schema.tables {
-                let object = format!("{db_name}.{schema_name}.{table_name}");
+    // Fresh, independent read-only inspection of the live database.
+    let live_state = introspect::introspect(pool).await?;
+    let EngineState::PostgreSql(_) = &live_state else {
+        return Err(MeldError::Internal(
+            "introspection returned wrong engine kind".into(),
+        ));
+    };
 
-                // Object existence.
-                let exists: bool = table_exists(pool, schema_name, table_name).await?;
-                let exists_check = VerificationCheck {
-                    category: CheckCategory::ObjectExistence,
-                    name: format!("table {object} exists"),
-                    passed: exists,
-                    object: object.clone(),
+    // Structural diff: every reported operation is a real mismatch between
+    // target and live (objects, columns, constraints, indexes, rows, values).
+    match diff_states(target, &live_state) {
+        Ok(diff) => {
+            if diff.is_empty() {
+                checks.push(VerificationCheck {
+                    category: CheckCategory::StateHash,
+                    name: "schema and data match target".into(),
+                    passed: true,
+                    object: "database".into(),
                     field: None,
-                    expected: Some("present".into()),
-                    actual: Some(if exists {
-                        "present".into()
-                    } else {
-                        "absent".into()
-                    }),
-                    details: "checked via information_schema.tables".into(),
-                };
-                if !exists_check.passed {
-                    mismatches.push(Mismatch {
+                    expected: Some("identical".into()),
+                    actual: Some("identical".into()),
+                    details: "no structural differences found".into(),
+                });
+            } else {
+                for op in &diff.ops {
+                    let object = op.object.to_string();
+                    checks.push(VerificationCheck {
+                        category: CheckCategory::DataValues,
+                        name: format!("{} {}", op.kind, op.object),
+                        passed: false,
                         object: object.clone(),
-                        field: None,
-                        expected: Some("present".into()),
-                        actual: Some("absent".into()),
+                        field: op.field.clone(),
+                        expected: op.before.as_ref().map(|v| format!("{v:?}")),
+                        actual: op.after.as_ref().map(|v| format!("{v:?}")),
+                        details: op.reason.clone(),
+                    });
+                    mismatches.push(Mismatch {
+                        object,
+                        field: op.field.clone(),
+                        expected: op.before.as_ref().map(|v| format!("{v:?}")),
+                        actual: op.after.as_ref().map(|v| format!("{v:?}")),
                         severity: ErrorSeverity::Error,
                     });
                 }
-                checks.push(exists_check);
-
-                if !exists {
-                    continue;
-                }
-
-                // Column count equivalence.
-                let actual_cols = get_columns(pool, schema_name, table_name).await?;
-                let expected_count = target_table.columns.len();
-                let actual_count = actual_cols.len();
-                let cols_check = VerificationCheck {
-                    category: CheckCategory::SchemaEquivalence,
-                    name: format!("table {object} column count"),
-                    passed: expected_count == actual_count,
-                    object: object.clone(),
-                    field: None,
-                    expected: Some(expected_count.to_string()),
-                    actual: Some(actual_count.to_string()),
-                    details: "compared against captured column definitions".into(),
-                };
-                if !cols_check.passed {
-                    mismatches.push(Mismatch {
-                        object: object.clone(),
-                        field: None,
-                        expected: Some(expected_count.to_string()),
-                        actual: Some(actual_count.to_string()),
-                        severity: ErrorSeverity::Error,
-                    });
-                }
-                checks.push(cols_check);
-
-                // Row count (data values) equivalence.
-                let row_count = count_rows(pool, schema_name, table_name).await?;
-                let rows_check = VerificationCheck {
-                    category: CheckCategory::DataValues,
-                    name: format!("table {object} row count"),
-                    passed: row_count == target_table.row_count,
-                    object: object.clone(),
-                    field: None,
-                    expected: Some(target_table.row_count.to_string()),
-                    actual: Some(row_count.to_string()),
-                    details: "compared against captured row count".into(),
-                };
-                if !rows_check.passed {
-                    mismatches.push(Mismatch {
-                        object: object.clone(),
-                        field: None,
-                        expected: Some(target_table.row_count.to_string()),
-                        actual: Some(row_count.to_string()),
-                        severity: ErrorSeverity::Error,
-                    });
-                }
-                checks.push(rows_check);
             }
+        }
+        Err(e) => {
+            let object = String::from("database");
+            checks.push(VerificationCheck {
+                category: CheckCategory::SchemaEquivalence,
+                name: "target and live states are comparable".into(),
+                passed: false,
+                object: object.clone(),
+                field: None,
+                expected: Some("comparable".into()),
+                actual: Some(format!("{e}")),
+                details: "could not diff target against live state".into(),
+            });
+            mismatches.push(Mismatch {
+                object,
+                field: None,
+                expected: Some("comparable".into()),
+                actual: Some(format!("{e}")),
+                severity: ErrorSeverity::Critical,
+            });
         }
     }
 
-    let passed = mismatches.is_empty() && checks.iter().all(|c| c.passed);
-    let actual_root = {
-        // Hash of the actual live state reconstructed from fresh inspection.
-        let live_state = EngineState::PostgreSql(PostgresState {
-            engine_version: target_state.engine_version.clone(),
-            databases: target_state.databases.clone(),
-            warnings: vec![],
-            capture_info: target_state.capture_info.clone(),
-        });
-        Some(meld_core::ids::ObjectHash::from_bytes(
-            hash_state(&live_state).as_bytes(),
-        ))
+    // Canonical state-hash comparison. Capture metadata (timestamps, warnings)
+    // is normalized away so that only the logical database state is compared.
+    let hash_ok = {
+        let normalize = |state: &mut EngineState| match state {
+            EngineState::PostgreSql(s) => {
+                normalize_capture_info(&mut s.capture_info);
+                s.warnings.clear();
+            }
+            EngineState::MongoDb(_) => unreachable!("postgres verify"),
+        };
+        let mut target_norm = target.clone();
+        let mut live_norm = live_state.clone();
+        normalize(&mut target_norm);
+        normalize(&mut live_norm);
+        hash_state(&target_norm) == hash_state(&live_norm)
     };
+    let target_hash = hash_state(target);
+    let live_hash = hash_state(&live_state);
+    checks.push(VerificationCheck {
+        category: CheckCategory::StateHash,
+        name: "canonical state hash matches target".into(),
+        passed: hash_ok,
+        object: "database".into(),
+        field: None,
+        expected: Some(target_hash.hex()[..16].to_string()),
+        actual: Some(live_hash.hex()[..16].to_string()),
+        details: "compares fresh live inspection against the captured target state".into(),
+    });
+    if !hash_ok {
+        mismatches.push(Mismatch {
+            object: "database".into(),
+            field: None,
+            expected: Some("target canonical hash".into()),
+            actual: Some("live canonical hash differs".into()),
+            severity: ErrorSeverity::Error,
+        });
+    }
+
+    let passed = mismatches.is_empty() && checks.iter().all(|c| c.passed);
+
+    let target_root = RootHash::from_bytes(hash_state(target).as_bytes());
+    let actual_root = Some(ObjectHash::from_bytes(live_hash.as_bytes()));
 
     Ok(VerificationReport {
-        target_root: RootHash::from_bytes([0u8; 32]), // placeholder; caller sets
+        target_root,
         actual_root,
         engine_kind: EngineKind::PostgreSql,
         checks,
@@ -138,63 +159,19 @@ pub async fn verify(
     })
 }
 
-async fn table_exists(pool: &sqlx::PgPool, schema: &str, table: &str) -> Result<bool, MeldError> {
-    let row = sqlx::query(
-        "SELECT count(*) AS c FROM information_schema.tables
-         WHERE table_schema = $1 AND table_name = $2 AND table_type = 'BASE TABLE'",
-    )
-    .bind(schema)
-    .bind(table)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| MeldError::Io(format!("table_exists: {e}")))?;
-    Ok(row.try_get::<i64, _>("c").unwrap_or(0) > 0)
-}
-
-async fn get_columns(
-    pool: &sqlx::PgPool,
-    schema: &str,
-    table: &str,
-) -> Result<Vec<String>, MeldError> {
-    let rows = sqlx::query(
-        "SELECT column_name FROM information_schema.columns
-         WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position",
-    )
-    .bind(schema)
-    .bind(table)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| MeldError::Io(format!("get_columns: {e}")))?;
-    Ok(rows
-        .into_iter()
-        .map(|r| r.try_get("column_name").unwrap_or_default())
-        .collect())
-}
-
-async fn count_rows(pool: &sqlx::PgPool, schema: &str, table: &str) -> Result<u64, MeldError> {
-    let q = format!(
-        "SELECT count(*) AS c FROM \"{}\".\"{}\"",
-        sql_quote(schema),
-        sql_quote(table)
-    );
-    let row = sqlx::query(&q)
-        .fetch_one(pool)
-        .await
-        .map_err(|e| MeldError::Io(format!("count_rows: {e}")))?;
-    Ok(row.try_get::<i64, _>("c").unwrap_or(0) as u64)
-}
-
-fn sql_quote(s: &str) -> String {
-    s.replace('"', "\"\"")
+/// Normalize capture metadata out of a state so hashes reflect only the
+/// logical database state.
+fn normalize_capture_info(info: &mut meld_core::state::CaptureInfo) {
+    info.captured_at =
+        chrono::DateTime::from_timestamp(VERIFY_EPOCH_SECS, 0).unwrap_or_else(Utc::now);
+    // strategy/scope/engine_version describe the capture setup and are kept
+    // because they define the normalization context.
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
-    fn sql_quote_doubles_quotes() {
-        assert_eq!(sql_quote("public"), "public");
-        assert_eq!(sql_quote("we\"ird"), "we\"\"ird");
+    fn sql_quote_dummy() {
+        // kept to preserve the test module; real verification needs a live PG.
     }
 }

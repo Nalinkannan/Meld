@@ -22,3 +22,4 @@ serde_json = { workspace = true }
 tempfile = { workspace = true }
 futures = "0.3"
 indexmap = { workspace = true }
+sqlx = { workspace = true }

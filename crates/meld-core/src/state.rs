@@ -16,7 +16,8 @@ use std::cmp::Ordering;
 use std::hash::{Hash as StdHash, Hasher};
 
 /// Current state format version. Increment when the state structure changes.
-pub const STATE_FORMAT_VERSION: u32 = 1;
+/// Bumped to 2 for the lossless BSON canonical value encoding (C3).
+pub const STATE_FORMAT_VERSION: u32 = 2;
 
 /// The database engine kind. Cross-engine merge/restore is explicitly rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -119,6 +120,10 @@ impl SnapshotScope {
 /// A type-aware canonical value used for row/document field values and hash
 /// computation. Type distinctions are preserved so that, e.g., a string `_id`
 /// and an ObjectId `_id` never collide.
+///
+/// Serialization format version 2: BSON-specific values are represented with
+/// explicit typed variants so they round-trip losslessly. Values that cannot
+/// be represented exactly must not be silently replaced with text placeholders.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CanonicalValue {
     Null,
@@ -131,8 +136,34 @@ pub enum CanonicalValue {
     Bytes(Vec<u8>),
     /// RFC3339 UTC timestamp.
     Timestamp(String),
-    /// A MongoDB ObjectId (12 bytes).
+    /// A MongoDB ObjectId (12 raw bytes, never the ASCII hex encoding).
     ObjectId(Vec<u8>),
+    /// A PostgreSQL UUID (16 raw bytes, distinct from Binary/Text).
+    Uuid([u8; 16]),
+    /// MongoDB Decimal128 (16 raw bytes).
+    Decimal128([u8; 16]),
+    /// MongoDB binary value with explicit BSON binary subtype.
+    Binary {
+        subtype: u8,
+        bytes: Vec<u8>,
+    },
+    /// MongoDB BSON timestamp (seconds + increment).
+    BsonTimestamp {
+        timestamp: u32,
+        increment: u32,
+    },
+    /// Regular expression (pattern + options).
+    Regex {
+        pattern: String,
+        options: String,
+    },
+    /// JavaScript code with optional scope document.
+    JavaScript {
+        code: String,
+        scope: Option<IndexMap<String, CanonicalValue>>,
+    },
+    MinKey,
+    MaxKey,
     /// A sequence; order is significant.
     Array(Vec<CanonicalValue>),
     /// A map; keys sorted at canonicalization time.
@@ -160,10 +191,52 @@ impl CanonicalValue {
             CanonicalValue::Bytes(_) => 7,
             CanonicalValue::Timestamp(_) => 8,
             CanonicalValue::ObjectId(_) => 9,
-            CanonicalValue::Array(_) => 10,
-            CanonicalValue::Document(_) => 11,
+            CanonicalValue::Uuid(_) => 10,
+            CanonicalValue::Decimal128(_) => 11,
+            CanonicalValue::Binary { .. } => 12,
+            CanonicalValue::BsonTimestamp { .. } => 13,
+            CanonicalValue::Regex { .. } => 14,
+            CanonicalValue::JavaScript { .. } => 15,
+            CanonicalValue::MinKey => 16,
+            CanonicalValue::MaxKey => 17,
+            CanonicalValue::Array(_) => 18,
+            CanonicalValue::Document(_) => 19,
         }
     }
+}
+
+/// Hash an optional scope map canonically (IndexMap does not implement Hash).
+fn canonical_option_map_hash(
+    scope: &Option<IndexMap<String, CanonicalValue>>,
+    state: &mut impl std::hash::Hasher,
+) {
+    match scope {
+        Some(s) => {
+            let mut bytes = Vec::new();
+            let entries: Vec<(&String, &CanonicalValue)> = s.iter().collect();
+            crate::canonical::write_sorted_map(&mut bytes, &entries);
+            bytes.hash(state);
+        }
+        None => 0u8.hash(state),
+    }
+}
+
+/// Compare two optional scope maps canonically.
+fn canonical_option_map_cmp(
+    a: &Option<IndexMap<String, CanonicalValue>>,
+    b: &Option<IndexMap<String, CanonicalValue>>,
+) -> Ordering {
+    let mut a_bytes = Vec::new();
+    let mut b_bytes = Vec::new();
+    if let Some(s) = a {
+        let entries: Vec<(&String, &CanonicalValue)> = s.iter().collect();
+        crate::canonical::write_sorted_map(&mut a_bytes, &entries);
+    }
+    if let Some(s) = b {
+        let entries: Vec<(&String, &CanonicalValue)> = s.iter().collect();
+        crate::canonical::write_sorted_map(&mut b_bytes, &entries);
+    }
+    a_bytes.cmp(&b_bytes)
 }
 
 impl PartialEq for CanonicalValue {
@@ -179,6 +252,50 @@ impl PartialEq for CanonicalValue {
                 (CanonicalValue::Bytes(a), CanonicalValue::Bytes(b)) => a == b,
                 (CanonicalValue::Timestamp(a), CanonicalValue::Timestamp(b)) => a == b,
                 (CanonicalValue::ObjectId(a), CanonicalValue::ObjectId(b)) => a == b,
+                (CanonicalValue::Uuid(a), CanonicalValue::Uuid(b)) => a == b,
+                (CanonicalValue::Decimal128(a), CanonicalValue::Decimal128(b)) => a == b,
+                (
+                    CanonicalValue::Binary {
+                        subtype: a,
+                        bytes: a_bytes,
+                    },
+                    CanonicalValue::Binary {
+                        subtype: b,
+                        bytes: b_bytes,
+                    },
+                ) => a == b && a_bytes == b_bytes,
+                (
+                    CanonicalValue::BsonTimestamp {
+                        timestamp: a_ts,
+                        increment: a_inc,
+                    },
+                    CanonicalValue::BsonTimestamp {
+                        timestamp: b_ts,
+                        increment: b_inc,
+                    },
+                ) => a_ts == b_ts && a_inc == b_inc,
+                (
+                    CanonicalValue::Regex {
+                        pattern: a_p,
+                        options: a_o,
+                    },
+                    CanonicalValue::Regex {
+                        pattern: b_p,
+                        options: b_o,
+                    },
+                ) => a_p == b_p && a_o == b_o,
+                (
+                    CanonicalValue::JavaScript {
+                        code: a_c,
+                        scope: a_s,
+                    },
+                    CanonicalValue::JavaScript {
+                        code: b_c,
+                        scope: b_s,
+                    },
+                ) => a_c == b_c && a_s == b_s,
+                (CanonicalValue::MinKey, CanonicalValue::MinKey) => true,
+                (CanonicalValue::MaxKey, CanonicalValue::MaxKey) => true,
                 (CanonicalValue::Array(a), CanonicalValue::Array(b)) => a == b,
                 (CanonicalValue::Document(a), CanonicalValue::Document(b)) => a == b,
                 (CanonicalValue::Null, CanonicalValue::Null) => true,
@@ -202,6 +319,29 @@ impl StdHash for CanonicalValue {
             CanonicalValue::Bytes(v) => v.hash(state),
             CanonicalValue::Timestamp(v) => v.hash(state),
             CanonicalValue::ObjectId(v) => v.hash(state),
+            CanonicalValue::Uuid(v) => v.hash(state),
+            CanonicalValue::Decimal128(v) => v.hash(state),
+            CanonicalValue::Binary { subtype, bytes } => {
+                subtype.hash(state);
+                bytes.hash(state);
+            }
+            CanonicalValue::BsonTimestamp {
+                timestamp,
+                increment,
+            } => {
+                timestamp.hash(state);
+                increment.hash(state);
+            }
+            CanonicalValue::Regex { pattern, options } => {
+                pattern.hash(state);
+                options.hash(state);
+            }
+            CanonicalValue::JavaScript { code, scope } => {
+                code.hash(state);
+                canonical_option_map_hash(scope, state);
+            }
+            CanonicalValue::MinKey => 0u8.hash(state),
+            CanonicalValue::MaxKey => 1u8.hash(state),
             CanonicalValue::Array(v) => v.hash(state),
             CanonicalValue::Document(v) => {
                 // Hash in sorted-key order for determinism.
@@ -233,6 +373,52 @@ impl Ord for CanonicalValue {
             (CanonicalValue::Bytes(a), CanonicalValue::Bytes(b)) => a.cmp(b),
             (CanonicalValue::Timestamp(a), CanonicalValue::Timestamp(b)) => a.cmp(b),
             (CanonicalValue::ObjectId(a), CanonicalValue::ObjectId(b)) => a.cmp(b),
+            (CanonicalValue::Uuid(a), CanonicalValue::Uuid(b)) => a.cmp(b),
+            (CanonicalValue::Decimal128(a), CanonicalValue::Decimal128(b)) => a.cmp(b),
+            (
+                CanonicalValue::Binary {
+                    subtype: a,
+                    bytes: a_bytes,
+                },
+                CanonicalValue::Binary {
+                    subtype: b,
+                    bytes: b_bytes,
+                },
+            ) => a.cmp(b).then_with(|| a_bytes.cmp(b_bytes)),
+            (
+                CanonicalValue::BsonTimestamp {
+                    timestamp: a_ts,
+                    increment: a_inc,
+                },
+                CanonicalValue::BsonTimestamp {
+                    timestamp: b_ts,
+                    increment: b_inc,
+                },
+            ) => a_ts.cmp(b_ts).then_with(|| a_inc.cmp(b_inc)),
+            (
+                CanonicalValue::Regex {
+                    pattern: a_p,
+                    options: a_o,
+                },
+                CanonicalValue::Regex {
+                    pattern: b_p,
+                    options: b_o,
+                },
+            ) => a_p.cmp(b_p).then_with(|| a_o.cmp(b_o)),
+            (
+                CanonicalValue::JavaScript {
+                    code: a_c,
+                    scope: a_s,
+                },
+                CanonicalValue::JavaScript {
+                    code: b_c,
+                    scope: b_s,
+                },
+            ) => a_c
+                .cmp(b_c)
+                .then_with(|| canonical_option_map_cmp(a_s, b_s)),
+            (CanonicalValue::MinKey, CanonicalValue::MinKey) => Ordering::Equal,
+            (CanonicalValue::MaxKey, CanonicalValue::MaxKey) => Ordering::Equal,
             (CanonicalValue::Array(a), CanonicalValue::Array(b)) => a.cmp(b),
             (CanonicalValue::Document(a), CanonicalValue::Document(b)) => {
                 let ka: Vec<&String> = a.keys().collect();
@@ -293,8 +479,55 @@ impl Canonicalize for CanonicalValue {
                 out.push(0x09);
                 write_bytes(out, bytes);
             }
-            CanonicalValue::Array(items) => {
+            CanonicalValue::Uuid(bytes) => {
+                out.push(0x12);
+                write_bytes(out, bytes);
+            }
+            CanonicalValue::Decimal128(bytes) => {
                 out.push(0x0a);
+                // 16 raw bytes, length-prefixed like write_bytes but with its own tag.
+                out.push(0x42);
+                write_u64(out, 16);
+                out.extend_from_slice(bytes);
+            }
+            CanonicalValue::Binary { subtype, bytes } => {
+                out.push(0x0b);
+                out.push(*subtype);
+                write_bytes(out, bytes);
+            }
+            CanonicalValue::BsonTimestamp {
+                timestamp,
+                increment,
+            } => {
+                out.push(0x0c);
+                write_u32(out, *timestamp);
+                write_u32(out, *increment);
+            }
+            CanonicalValue::Regex { pattern, options } => {
+                out.push(0x0d);
+                write_str(out, pattern);
+                write_str(out, options);
+            }
+            CanonicalValue::JavaScript { code, scope } => {
+                out.push(0x0e);
+                write_str(out, code);
+                match scope {
+                    Some(s) => {
+                        out.push(0x01);
+                        let entries: Vec<(&String, &CanonicalValue)> = s.iter().collect();
+                        write_sorted_map(out, &entries);
+                    }
+                    None => out.push(0x00),
+                }
+            }
+            CanonicalValue::MinKey => {
+                out.push(0x0f);
+            }
+            CanonicalValue::MaxKey => {
+                out.push(0x10);
+            }
+            CanonicalValue::Array(items) => {
+                out.push(0x11);
                 write_sequence(out, items);
             }
             CanonicalValue::Document(fields) => {
@@ -589,12 +822,24 @@ impl Canonicalize for PgTable {
             None => out.push(0x00),
         }
         write_u64(out, self.row_count);
-        // Rows: identity + values.
-        for row in &self.rows {
+        // Rows: identity + values, canonically ordered by identity so the hash
+        // is independent of extraction order.
+        let mut ordered_rows: Vec<&PgRow> = self.rows.iter().collect();
+        ordered_rows.sort_by_key(|a| a.identity.canonical_bytes());
+        for row in &ordered_rows {
             match &row.identity {
                 PgRowIdentity::PrimaryKey(values) => {
                     out.push(0x01);
-                    write_sequence(out, values);
+                    let entries: Vec<CanonicalValue> = values
+                        .iter()
+                        .map(|(name, value)| {
+                            CanonicalValue::Array(vec![
+                                CanonicalValue::Text(name.clone()),
+                                value.clone(),
+                            ])
+                        })
+                        .collect();
+                    write_sequence(out, &entries);
                 }
                 PgRowIdentity::ContentHash(bytes) => {
                     out.push(0x00);
@@ -652,11 +897,13 @@ pub struct PgRow {
     pub values: IndexMap<String, CanonicalValue>,
 }
 
-/// Stable identity for a row: primary-key values when present, otherwise a
-/// content hash (documented as best-effort).
+/// Stable identity for a row: primary-key values when present, each paired
+/// with its column name so the name-to-typed-value association is preserved
+/// (composite keys work), otherwise a content hash (documented as
+/// best-effort).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PgRowIdentity {
-    PrimaryKey(Vec<CanonicalValue>),
+    PrimaryKey(Vec<(String, CanonicalValue)>),
     ContentHash([u8; 16]),
 }
 
@@ -666,7 +913,16 @@ impl Canonicalize for PgRow {
         match &self.identity {
             PgRowIdentity::PrimaryKey(values) => {
                 out.push(0x01);
-                write_sequence(out, values);
+                let entries: Vec<CanonicalValue> = values
+                    .iter()
+                    .map(|(name, value)| {
+                        CanonicalValue::Array(vec![
+                            CanonicalValue::Text(name.clone()),
+                            value.clone(),
+                        ])
+                    })
+                    .collect();
+                write_sequence(out, &entries);
             }
             PgRowIdentity::ContentHash(bytes) => {
                 out.push(0x00);
@@ -683,7 +939,18 @@ impl Canonicalize for PgRowIdentity {
         match self {
             PgRowIdentity::PrimaryKey(values) => {
                 out.push(0x01);
-                write_sequence(out, values);
+                // Each entry is (column name, typed value), written as a
+                // two-element sequence so the name/value association survives.
+                let entries: Vec<CanonicalValue> = values
+                    .iter()
+                    .map(|(name, value)| {
+                        CanonicalValue::Array(vec![
+                            CanonicalValue::Text(name.clone()),
+                            value.clone(),
+                        ])
+                    })
+                    .collect();
+                write_sequence(out, &entries);
             }
             PgRowIdentity::ContentHash(bytes) => {
                 out.push(0x00);
@@ -925,10 +1192,12 @@ impl Canonicalize for MongoIndex {
     }
 }
 
-/// A MongoDB view definition.
+/// A MongoDB view definition. `view_on` is the source collection the view is
+/// defined over -- it must never default to the view's own name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MongoView {
     pub name: String,
+    pub view_on: String,
     pub definition: IndexMap<String, CanonicalValue>,
 }
 
@@ -936,6 +1205,7 @@ impl Canonicalize for MongoView {
     fn canonicalize(&self, out: &mut Vec<u8>) {
         out.push(0xa3);
         write_str(out, &self.name);
+        write_str(out, &self.view_on);
         write_sorted_map(
             out,
             &self
@@ -999,15 +1269,12 @@ impl Canonicalize for MongoCollectionState {
         for v in &self.views {
             v.canonicalize(out);
         }
-        write_sequence(
-            out,
-            &self
-                .documents
-                .iter()
-                .map(|d| CanonicalValue::Text(format!("{:?}", d.id)))
-                .collect::<Vec<_>>(),
-        );
-        for d in &self.documents {
+        // Documents are canonically ordered by _id bytes so the hash is
+        // independent of extraction order (document order in a collection is
+        // not semantically significant).
+        let mut ordered_docs: Vec<&MongoDocument> = self.documents.iter().collect();
+        ordered_docs.sort_by_key(|a| a.id.canonical_bytes());
+        for d in &ordered_docs {
             d.canonicalize(out);
         }
         write_u64(out, self.document_count);

@@ -18,5 +18,7 @@ bson = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
 mongodb = { workspace = true }
+futures = "0.3"
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["full"] }

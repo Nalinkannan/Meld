@@ -22,5 +22,7 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 indexmap = { workspace = true }
+unicode-segmentation = { workspace = true }
+unicode-width = { workspace = true }
 
 [dev-dependencies]

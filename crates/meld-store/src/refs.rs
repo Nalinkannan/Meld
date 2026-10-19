@@ -64,10 +64,15 @@ pub fn get_branch(db: &redb::Database, branch: &str) -> Result<Option<CommitHash
         table
             .get(&branch.to_string())
             .map_err(|e| MeldError::Io(format!("get branch {branch}: {e}")))?
-            .map(|g| CommitHash(Hash::from_hex(g.value().as_str()).unwrap()))
+            .map(|g| {
+                Hash::from_hex(g.value().as_str())
+                    .map(CommitHash)
+                    .map_err(|e| MeldError::Io(format!("corrupt branch hash for {branch}: {e}")))
+            })
+            .transpose()
     };
     drop(txn);
-    Ok(current)
+    current
 }
 
 /// Read HEAD's target commit.
@@ -90,10 +95,15 @@ pub fn get_head(db: &redb::Database) -> Result<Option<CommitHash>, MeldError> {
         table
             .get(&HEAD_KEY.to_string())
             .map_err(|e| MeldError::Io(format!("get head: {e}")))?
-            .map(|g| CommitHash(Hash::from_hex(g.value().as_str()).unwrap()))
+            .map(|g| {
+                Hash::from_hex(g.value().as_str())
+                    .map(CommitHash)
+                    .map_err(|e| MeldError::Io(format!("corrupt head hash: {e}")))
+            })
+            .transpose()
     };
     drop(txn);
-    Ok(current)
+    current
 }
 
 /// Atomically set a branch to `target`, failing if the branch's current value
@@ -115,9 +125,13 @@ pub fn compare_and_swap_branch(
             .get(&branch.to_string())
             .map_err(|e| MeldError::Io(format!("get branch {branch}: {e}")))?
             .map(|g| g.value());
-        let current: Option<CommitHash> = current_hex
-            .as_deref()
-            .and_then(|s| Hash::from_hex(s).ok().map(CommitHash));
+        let current: Option<CommitHash> =
+            match current_hex.as_deref() {
+                Some(s) => Some(Hash::from_hex(s).map(CommitHash).map_err(|e| {
+                    MeldError::Io(format!("corrupt branch hash for {branch}: {e}"))
+                })?),
+                None => None,
+            };
 
         match (expected, current) {
             (None, Some(_)) => {
@@ -220,6 +234,69 @@ pub fn set_head(db: &redb::Database, target: &CommitHash) -> Result<(), MeldErro
     }
     txn.commit()
         .map_err(|e| MeldError::Io(format!("commit head: {e}")))?;
+    Ok(())
+}
+
+/// Atomically update a branch (compare-and-swap) and set HEAD in a single
+/// store transaction. Either both references change or neither does, so a
+/// failure can never leave the active branch and HEAD inconsistent.
+///
+/// `expected` follows `compare_and_swap_branch` semantics: `None` requires
+/// the branch not to exist; `Some(h)` requires the branch to point at `h`.
+pub fn compare_and_swap_branch_and_head(
+    db: &redb::Database,
+    branch: &str,
+    expected: Option<&CommitHash>,
+    target: &CommitHash,
+) -> Result<(), MeldError> {
+    let txn = db
+        .begin_write()
+        .map_err(|e| MeldError::Io(format!("begin write: {e}")))?;
+    {
+        let mut table = txn
+            .open_table(BRANCHES)
+            .map_err(|e| MeldError::Io(format!("open branches table: {e}")))?;
+        let current_hex: Option<String> = table
+            .get(&branch.to_string())
+            .map_err(|e| MeldError::Io(format!("get branch {branch}: {e}")))?
+            .map(|g| g.value());
+        let current: Option<CommitHash> =
+            match current_hex.as_deref() {
+                Some(s) => Some(Hash::from_hex(s).map(CommitHash).map_err(|e| {
+                    MeldError::Io(format!("corrupt branch hash for {branch}: {e}"))
+                })?),
+                None => None,
+            };
+        match (expected, current) {
+            (None, Some(_)) => {
+                return Err(MeldError::Reference(format!(
+                    "branch {branch} already exists (would overwrite)"
+                )));
+            }
+            (Some(e), None) => {
+                return Err(MeldError::Reference(format!(
+                    "branch {branch} does not exist (expected {e})"
+                )));
+            }
+            (Some(e), Some(c)) if e != &c => {
+                return Err(MeldError::Reference(format!(
+                    "branch {branch} changed concurrently (expected {e}, found {c})"
+                )));
+            }
+            _ => {}
+        }
+        table
+            .insert(branch.to_string(), target.hex())
+            .map_err(|e| MeldError::Io(format!("set branch {branch}: {e}")))?;
+
+        let mut head = txn
+            .open_table(HEAD)
+            .map_err(|e| MeldError::Io(format!("open head table: {e}")))?;
+        head.insert(HEAD_KEY.to_string(), target.hex())
+            .map_err(|e| MeldError::Io(format!("set head: {e}")))?;
+    }
+    txn.commit()
+        .map_err(|e| MeldError::Io(format!("commit branch and head: {e}")))?;
     Ok(())
 }
 

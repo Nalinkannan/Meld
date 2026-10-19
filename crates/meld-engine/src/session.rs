@@ -101,6 +101,87 @@ impl Session {
             .map_err(|e| EngineError::Session(e.to_string()))
     }
 
+    /// Execute an ad-hoc query against the connected database through the
+    /// active adapter. Read-only mode is enforced server-side where the
+    /// engine supports it.
+    pub async fn execute_query(
+        &self,
+        request: meld_adapter::adapter::QueryRequest,
+    ) -> Result<meld_adapter::adapter::QueryResult, EngineError> {
+        let adapter = self.adapter()?;
+        adapter
+            .execute_query(request)
+            .await
+            .map_err(|e| EngineError::Session(e.to_string()))
+    }
+
+    /// Recover from an interrupted restore, if one is detected.
+    ///
+    /// If a restore-marker exists in the store, a previous restore was
+    /// interrupted. This restores the live database from the safety snapshot
+    /// commit recorded in the marker, then clears the marker.
+    pub async fn recover_interrupted_restore(&mut self) -> Result<Option<CommitHash>, EngineError> {
+        let Some(safety_hash) = self
+            .store
+            .get_restore_marker()
+            .map_err(|e| EngineError::Session(format!("failed to read restore marker: {e}")))?
+        else {
+            return Ok(None);
+        };
+
+        let safety_commit = self
+            .store
+            .get_commit(&safety_hash)
+            .map_err(|e| EngineError::Session(format!("failed to load safety snapshot: {e}")))?;
+
+        let adapter = self.adapter_mut()?;
+        // Restore the live database to the safety snapshot state.
+        let result = adapter
+            .execute_restore_plan(&{
+                // Build a plan from the safety snapshot vs live.
+                use crate::restore::build_restore_plan;
+                build_restore_plan(adapter, &safety_commit)
+                    .await
+                    .map_err(|e| {
+                        EngineError::Session(format!("failed to build recovery plan: {e}"))
+                    })?
+            })
+            .await
+            .map_err(|e| EngineError::Session(format!("recovery restore failed: {e}")))?;
+
+        if result.operations_failed > 0 {
+            return Err(EngineError::Session(format!(
+                "interrupted restore recovery failed: {}; safety snapshot id: {}",
+                result.messages.join("; "),
+                safety_hash.short(12)
+            )));
+        }
+
+        // Verify the recovery.
+        let report = adapter
+            .verify(&safety_commit.state)
+            .await
+            .map_err(|e| EngineError::Session(format!("recovery verification failed: {e}")))?;
+        if !report.passed {
+            return Err(EngineError::Session(format!(
+                "interrupted restore recovery verification failed; safety snapshot id: {}",
+                safety_hash.short(12)
+            )));
+        }
+
+        // Move HEAD to the safety snapshot and clear the marker.
+        self.store.set_head(&safety_hash).map_err(|e| {
+            EngineError::Session(format!("failed to advance HEAD after recovery: {e}"))
+        })?;
+        self.store.clear_restore_marker().map_err(|e| {
+            EngineError::Session(format!(
+                "failed to clear restore marker after recovery: {e}"
+            ))
+        })?;
+
+        Ok(Some(safety_hash))
+    }
+
     /// Create a new branch at `target` (defaults to HEAD if None).
     pub async fn create_branch(
         &mut self,

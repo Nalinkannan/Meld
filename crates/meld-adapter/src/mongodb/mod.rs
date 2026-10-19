@@ -4,10 +4,12 @@
 //! distinctions are preserved: a string `_id` and an ObjectId `_id` are
 //! never treated as the same identity.
 
-use crate::adapter::{ConnectionInfo, DatabaseAdapter, ExecutionResult, MongoConfig};
+use crate::adapter::{
+    ConnectionInfo, DatabaseAdapter, ExecutionResult, MongoConfig, QueryRequest, QueryResult,
+};
 use crate::capabilities::Capabilities;
 use meld_core::error::MeldError;
-use meld_core::state::{EngineKind, EngineState};
+use meld_core::state::{CanonicalValue, EngineKind, EngineState};
 use meld_core::verify::VerificationReport;
 use tracing::info;
 
@@ -187,6 +189,100 @@ impl DatabaseAdapter for MongoAdapter {
             .await
             .map_err(|e| MeldError::Io(format!("ping failed: {e}")))?;
         Ok(())
+    }
+
+    async fn execute_query(
+        &self,
+        request: crate::adapter::QueryRequest,
+    ) -> Result<crate::adapter::QueryResult, MeldError> {
+        let QueryRequest::MongoDb {
+            collection,
+            filter,
+            projection,
+            sort,
+            limit,
+        } = request
+        else {
+            return Err(MeldError::Internal(
+                "execute_query called with PostgreSQL request on MongoDB adapter".into(),
+            ));
+        };
+
+        let start = std::time::Instant::now();
+        let db = self.client()?.database(self.db_name()?);
+        let coll = db.collection::<mongodb::bson::Document>(&collection);
+
+        let filter_doc: mongodb::bson::Document = match filter {
+            Some(s) => serde_json::from_str(&s)
+                .map_err(|e| MeldError::InvalidInput(format!("invalid JSON filter: {e}")))?,
+            None => mongodb::bson::doc! {},
+        };
+
+        let projection_doc: Option<mongodb::bson::Document> =
+            match projection {
+                Some(p) => Some(serde_json::from_str(&p).map_err(|e| {
+                    MeldError::InvalidInput(format!("invalid JSON projection: {e}"))
+                })?),
+                None => None,
+            };
+        let sort_doc: Option<mongodb::bson::Document> = match sort {
+            Some(s) => Some(
+                serde_json::from_str(&s)
+                    .map_err(|e| MeldError::InvalidInput(format!("invalid JSON sort: {e}")))?,
+            ),
+            None => None,
+        };
+
+        let options = mongodb::options::FindOptions::builder()
+            .projection(projection_doc)
+            .sort(sort_doc)
+            .limit(limit.map(|l| l as i64))
+            .build();
+
+        let mut cursor = coll
+            .find(filter_doc, options)
+            .await
+            .map_err(|e| MeldError::Io(format!("find documents: {e}")))?;
+
+        // Collect all documents, then compute the sorted union of field names
+        // as columns (stable, deterministic output).
+        let mut docs: Vec<mongodb::bson::Document> = Vec::new();
+        let mut columns: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        while cursor
+            .advance()
+            .await
+            .map_err(|e| MeldError::Io(format!("document cursor: {e}")))?
+        {
+            let doc: mongodb::bson::Document = cursor
+                .deserialize_current()
+                .map_err(|e| MeldError::Io(format!("deserialize document: {e}")))?;
+            for k in doc.keys() {
+                columns.insert(k.clone());
+            }
+            docs.push(doc);
+        }
+
+        let columns: Vec<String> = columns.into_iter().collect();
+        let mut rows: Vec<Vec<CanonicalValue>> = Vec::with_capacity(docs.len());
+        for doc in &docs {
+            let mut cells = Vec::with_capacity(columns.len());
+            for col in &columns {
+                cells.push(match doc.get(col) {
+                    Some(v) => crate::mongodb::extract::bson_value_to_canonical(v)?,
+                    None => CanonicalValue::Null,
+                });
+            }
+            rows.push(cells);
+        }
+
+        let row_count = rows.len() as u64;
+        Ok(QueryResult {
+            columns,
+            rows,
+            row_count,
+            truncated: false,
+            duration_ms: start.elapsed().as_millis() as u64,
+        })
     }
 }
 

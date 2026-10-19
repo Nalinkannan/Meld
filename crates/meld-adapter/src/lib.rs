@@ -12,7 +12,7 @@ pub mod registry;
 
 pub use adapter::{
     ConnectionConfig, ConnectionInfo, DatabaseAdapter, ExecutionResult, MongoConfig,
-    PostgresConfig, SnapshotResult,
+    PostgresConfig, QueryRequest, QueryResult, SnapshotResult,
 };
 pub use capabilities::{Capabilities, ConnectionValidation, ServerInfo};
 pub use registry::AdapterRegistry;

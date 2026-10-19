@@ -4,7 +4,9 @@
 //! PostgreSQL and MongoDB. Driver-specific types never leak into `meld-core`.
 
 use crate::capabilities::Capabilities;
-use meld_core::{commit::Commit, error::MeldError, ids::CommitHash, state::EngineState};
+use meld_core::{
+    commit::Commit, error::MeldError, ids::CommitHash, state::CanonicalValue, state::EngineState,
+};
 use serde::{Deserialize, Serialize};
 
 /// Connection configuration for a database.
@@ -116,5 +118,48 @@ pub trait DatabaseAdapter: Send + Sync + std::fmt::Debug {
         plan: &meld_core::plan::RestorePlan,
     ) -> Result<ExecutionResult, MeldError>;
 
+    /// Execute an ad-hoc query against the live database. This is separate
+    /// from snapshot, diff, restore, and merge workflows. Read-only mode is
+    /// enforced server-side where the engine supports it (e.g. PostgreSQL
+    /// `SET TRANSACTION READ ONLY`).
+    async fn execute_query(&self, request: QueryRequest) -> Result<QueryResult, MeldError>;
+
     async fn health_check(&self) -> Result<(), MeldError>;
+}
+
+/// A typed ad-hoc query request. Variants are engine-specific; driver types
+/// never leak into `meld-core`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QueryRequest {
+    /// PostgreSQL SQL.
+    PostgreSql {
+        sql: String,
+        /// When true, the query runs in a read-only transaction and writes
+        /// are rejected by the server.
+        read_only: bool,
+    },
+    /// MongoDB structured query.
+    MongoDb {
+        collection: String,
+        /// JSON filter document (default: match all).
+        filter: Option<String>,
+        /// JSON projection document.
+        projection: Option<String>,
+        /// JSON sort document.
+        sort: Option<String>,
+        /// Maximum number of documents to return.
+        limit: Option<u64>,
+    },
+}
+
+/// Typed result of an ad-hoc query execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryResult {
+    pub columns: Vec<String>,
+    /// Row cells aligned with `columns`.
+    pub rows: Vec<Vec<CanonicalValue>>,
+    pub row_count: u64,
+    /// True when the result was truncated to the server-side row cap.
+    pub truncated: bool,
+    pub duration_ms: u64,
 }

@@ -27,7 +27,9 @@ pub async fn history(
         if !visited.insert(hash) {
             continue;
         }
-        if let Some(max) = limit && commits.len() >= max {
+        if let Some(max) = limit
+            && commits.len() >= max
+        {
             break;
         }
 

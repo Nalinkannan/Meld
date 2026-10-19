@@ -46,6 +46,10 @@ crossterm = "0.28"
 # Testing
 tempfile = "3"
 
+# Unicode (grapheme-aware editing)
+unicode-segmentation = "1"
+unicode-width = "0.1"
+
 [profile.dev]
 opt-level = 1
 

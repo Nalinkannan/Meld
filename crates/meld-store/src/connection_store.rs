@@ -55,17 +55,20 @@ pub fn get_profile(
     let txn = db
         .begin_read()
         .map_err(|e| MeldError::Io(format!("begin read: {e}")))?;
-    let profile = {
+    let profile: Option<Result<ConnectionProfile, MeldError>> = {
         let table = txn
             .open_table(CONNECTIONS)
             .map_err(|e| MeldError::Io(format!("open connections table: {e}")))?;
         table
             .get(&name.to_string())
             .map_err(|e| MeldError::Io(format!("get connection {name}: {e}")))?
-            .map(|g| serde_json::from_str(&g.value()).expect("stored connection is valid JSON"))
+            .map(|g| {
+                serde_json::from_str(&g.value())
+                    .map_err(|e| MeldError::Io(format!("corrupt connection profile {name}: {e}")))
+            })
     };
     drop(txn);
-    Ok(profile)
+    profile.transpose()
 }
 
 pub fn list_profiles(db: &redb::Database) -> Result<Vec<ConnectionProfile>, MeldError> {
@@ -84,7 +87,8 @@ pub fn list_profiles(db: &redb::Database) -> Result<Vec<ConnectionProfile>, Meld
             let (_key, value) =
                 result.map_err(|e| MeldError::Io(format!("iterate connections: {e}")))?;
             out.push(
-                serde_json::from_str(&value.value()).expect("stored connection is valid JSON"),
+                serde_json::from_str(&value.value())
+                    .map_err(|e| MeldError::Io(format!("corrupt connection profile: {e}")))?,
             );
         }
         out

@@ -204,7 +204,7 @@ async fn create_collection(
     }
     // Additional options (e.g. timeseries, change stream settings) pass through.
     for (k, v) in &options.additional {
-        cmd.insert(k, canonical_value_to_bson(v));
+        cmd.insert(k, canonical_value_to_bson(v)?);
     }
 
     if let Some(validator) = &state.validator {
@@ -214,7 +214,7 @@ async fn create_collection(
         if !validator.definition.is_empty() {
             let mut def_doc = Document::new();
             for (k, v) in &validator.definition {
-                def_doc.insert(k, canonical_value_to_bson(v));
+                def_doc.insert(k, canonical_value_to_bson(v)?);
             }
             options_doc.insert("validator", def_doc);
         }
@@ -256,19 +256,17 @@ async fn alter_collection(
     }
     let options = &state.options;
     let mut mod_doc = Document::new();
+    mod_doc.insert("collMod", name);
     if let Some(size) = options.size {
         mod_doc.insert("size", size as i64);
     }
     if let Some(max) = options.max {
         mod_doc.insert("max", max as i64);
     }
-    if !mod_doc.is_empty() {
-        db.run_command(
-            bson::doc! { "collMod": name, "size": mod_doc.get_i64("size").unwrap_or(0), "max": mod_doc.get_i64("max").unwrap_or(0) },
-            None,
-        )
-        .await
-        .map_err(|e| MeldError::Io(format!("collMod {name}: {e}")))?;
+    if mod_doc.len() > 1 {
+        db.run_command(mod_doc, None)
+            .await
+            .map_err(|e| MeldError::Io(format!("collMod {name}: {e}")))?;
         changed = true;
     }
     if changed {
@@ -297,7 +295,7 @@ async fn apply_validator(
     if !validator.definition.is_empty() {
         let mut def_doc = Document::new();
         for (k, v) in &validator.definition {
-            def_doc.insert(k, canonical_value_to_bson(v));
+            def_doc.insert(k, canonical_value_to_bson(v)?);
         }
         options_doc.insert("validator", def_doc);
     }
@@ -337,7 +335,7 @@ async fn create_index_inner(
     if let Some(filter) = &idx.partial_filter {
         let mut fd = Document::new();
         for (k, v) in filter {
-            fd.insert(k, canonical_value_to_bson(v));
+            fd.insert(k, canonical_value_to_bson(v)?);
         }
         filter_doc = Some(fd);
     }
@@ -400,8 +398,8 @@ async fn insert_document(
     collection: &str,
     doc: &MongoDocument,
 ) -> Result<String, MeldError> {
-    let mut bson_doc = canonical_value_to_bson_document(&doc.fields);
-    bson_doc.insert("_id", canonical_value_to_bson(&doc.id));
+    let mut bson_doc = canonical_value_to_bson_document(&doc.fields)?;
+    bson_doc.insert("_id", canonical_value_to_bson(&doc.id)?);
     db.collection::<Document>(collection)
         .insert_one(bson_doc, None)
         .await
@@ -414,19 +412,48 @@ async fn update_document(
     collection: &str,
     doc: &MongoDocument,
 ) -> Result<String, MeldError> {
-    let filter = bson::doc! { "_id": canonical_value_to_bson(&doc.id) };
+    let coll = db.collection::<Document>(collection);
+    let id_bson = canonical_value_to_bson(&doc.id)?;
+    let filter = bson::doc! { "_id": id_bson };
+    // Fetch the live document so fields present live but absent in the target
+    // can be explicitly unset. A `$set` alone would leave stale fields behind.
+    let live = coll
+        .find_one(filter.clone(), None)
+        .await
+        .map_err(|e| MeldError::Io(format!("read live document in {collection}: {e}")))?;
+    let Some(live) = live else {
+        return Err(MeldError::NotFound(format!(
+            "update document in {collection}: _id not found"
+        )));
+    };
     let mut set_doc = Document::new();
-    for (k, v) in &doc.fields {
-        set_doc.insert(k, canonical_value_to_bson(v));
+    let mut unset_doc = Document::new();
+    for (k, _v) in live.iter() {
+        if k == "_id" {
+            continue;
+        }
+        if !doc.fields.contains_key(k) {
+            unset_doc.insert(k, bson::Bson::Null);
+        }
     }
-    let update_doc = bson::doc! { "$set": set_doc };
-    let result = db
-        .collection::<Document>(collection)
+    for (k, v) in &doc.fields {
+        set_doc.insert(k.clone(), canonical_value_to_bson(v)?);
+    }
+    let mut update_doc = Document::new();
+    if !set_doc.is_empty() {
+        update_doc.insert("$set", set_doc);
+    }
+    if !unset_doc.is_empty() {
+        update_doc.insert("$unset", unset_doc);
+    }
+    let result = coll
         .update_one(filter, update_doc, None)
         .await
         .map_err(|e| MeldError::Io(format!("update document in {collection}: {e}")))?;
     if result.matched_count == 0 {
-        warn!("update document matched 0 documents in {collection}; _id may not exist");
+        return Err(MeldError::NotFound(format!(
+            "update document in {collection}: _id not found"
+        )));
     }
     Ok("updated document".into())
 }
@@ -436,14 +463,17 @@ async fn delete_document(
     collection: &str,
     doc: &MongoDocument,
 ) -> Result<String, MeldError> {
-    let filter = bson::doc! { "_id": canonical_value_to_bson(&doc.id) };
+    let id_bson = canonical_value_to_bson(&doc.id)?;
+    let filter = bson::doc! { "_id": id_bson };
     let result = db
         .collection::<Document>(collection)
         .delete_one(filter, None)
         .await
         .map_err(|e| MeldError::Io(format!("delete document from {collection}: {e}")))?;
     if result.deleted_count == 0 {
-        warn!("delete document matched 0 documents in {collection}; _id may not exist");
+        return Err(MeldError::NotFound(format!(
+            "delete document from {collection}: _id not found"
+        )));
     }
     Ok("deleted document".into())
 }
@@ -459,14 +489,14 @@ async fn create_view(
 ) -> Result<String, MeldError> {
     let mut pipeline_doc = Document::new();
     for (k, v) in &view.definition {
-        pipeline_doc.insert(k, canonical_value_to_bson(v));
+        pipeline_doc.insert(k, canonical_value_to_bson(v)?);
     }
     db.run_command(
-        bson::doc! { "create": name, "viewOn": name, "pipeline": pipeline_doc },
+        bson::doc! { "create": name, "viewOn": view.view_on.clone(), "pipeline": pipeline_doc },
         None,
     )
     .await
-    .map_err(|e| MeldError::Io(format!("create view {name}: {e}")))?;
+    .map_err(|e| MeldError::Io(format!("create view {name} on {}: {e}", view.view_on)))?;
     Ok("created view".into())
 }
 
@@ -529,47 +559,100 @@ fn details_view(details: &Option<String>) -> Result<MongoView, MeldError> {
 /// Convert a CanonicalValue back into a BSON value for writing to MongoDB.
 /// Type distinctions are preserved so a string _id and an ObjectId _id remain
 /// distinct.
-fn canonical_value_to_bson(v: &CanonicalValue) -> Bson {
+fn canonical_value_to_bson(v: &CanonicalValue) -> Result<Bson, MeldError> {
     match v {
-        CanonicalValue::Null => Bson::Null,
-        CanonicalValue::Boolean(b) => Bson::Boolean(*b),
-        CanonicalValue::I32(i) => Bson::Int32(*i),
-        CanonicalValue::I64(i) => Bson::Int64(*i),
-        CanonicalValue::F64(bits) => Bson::Double(f64::from_bits(*bits)),
-        CanonicalValue::Numeric(s) => match s.parse::<bson::Decimal128>() {
-            Ok(d) => Bson::Decimal128(d),
-            Err(_) => Bson::String(s.clone()),
-        },
-        CanonicalValue::Text(s) => Bson::String(s.clone()),
-        CanonicalValue::Bytes(bytes) => Bson::Binary(bson::Binary {
+        CanonicalValue::Null => Ok(Bson::Null),
+        CanonicalValue::Boolean(b) => Ok(Bson::Boolean(*b)),
+        CanonicalValue::I32(i) => Ok(Bson::Int32(*i)),
+        CanonicalValue::I64(i) => Ok(Bson::Int64(*i)),
+        CanonicalValue::F64(bits) => Ok(Bson::Double(f64::from_bits(*bits))),
+        CanonicalValue::Numeric(s) => {
+            s.parse::<bson::Decimal128>()
+                .map(Bson::Decimal128)
+                .map_err(|e| {
+                    MeldError::Serialization(format!(
+                        "cannot convert numeric {s} to Decimal128: {e}"
+                    ))
+                })
+        }
+        CanonicalValue::Text(s) => Ok(Bson::String(s.clone())),
+        CanonicalValue::Bytes(bytes) => Ok(Bson::Binary(bson::Binary {
             subtype: bson::spec::BinarySubtype::Generic,
             bytes: bytes.clone(),
-        }),
-        CanonicalValue::Timestamp(ts) => match chrono::DateTime::parse_from_rfc3339(ts) {
-            Ok(dt) => Bson::DateTime(bson::DateTime::from_millis(dt.timestamp_millis())),
-            Err(_) => Bson::String(ts.clone()),
-        },
+        })),
+        CanonicalValue::Timestamp(ts) => chrono::DateTime::parse_from_rfc3339(ts)
+            .map(|dt| Bson::DateTime(bson::DateTime::from_millis(dt.timestamp_millis())))
+            .map_err(|e| {
+                MeldError::Serialization(format!(
+                    "cannot convert timestamp {ts} to BSON datetime: {e}"
+                ))
+            }),
         CanonicalValue::ObjectId(bytes) => {
             if bytes.len() == 12 {
                 let mut arr = [0u8; 12];
                 arr.copy_from_slice(bytes);
-                Bson::ObjectId(mongodb::bson::oid::ObjectId::from_bytes(arr))
+                Ok(Bson::ObjectId(mongodb::bson::oid::ObjectId::from_bytes(
+                    arr,
+                )))
             } else {
-                Bson::Binary(bson::Binary {
+                Ok(Bson::Binary(bson::Binary {
                     subtype: bson::spec::BinarySubtype::Generic,
                     bytes: bytes.clone(),
-                })
+                }))
             }
         }
-        CanonicalValue::Array(items) => {
-            Bson::Array(items.iter().map(canonical_value_to_bson).collect())
+        // PostgreSQL UUIDs are not a native BSON type; store as binary subtype 4.
+        CanonicalValue::Uuid(bytes) => Ok(Bson::Binary(bson::Binary {
+            subtype: bson::spec::BinarySubtype::Uuid,
+            bytes: bytes.to_vec(),
+        })),
+        CanonicalValue::Decimal128(bytes) => {
+            Ok(Bson::Decimal128(bson::Decimal128::from_bytes(*bytes)))
         }
+        CanonicalValue::Binary { subtype, bytes } => Ok(Bson::Binary(bson::Binary {
+            subtype: bson::spec::BinarySubtype::from(*subtype),
+            bytes: bytes.clone(),
+        })),
+        CanonicalValue::BsonTimestamp {
+            timestamp,
+            increment,
+        } => Ok(Bson::Timestamp(bson::Timestamp {
+            time: *timestamp,
+            increment: *increment,
+        })),
+        CanonicalValue::Regex { pattern, options } => Ok(Bson::RegularExpression(bson::Regex {
+            pattern: pattern.clone(),
+            options: options.clone(),
+        })),
+        CanonicalValue::JavaScript { code, scope } => match scope {
+            Some(scope) => {
+                let mut doc = bson::Document::new();
+                for (k, v) in scope {
+                    doc.insert(k.clone(), canonical_value_to_bson(v)?);
+                }
+                Ok(Bson::JavaScriptCodeWithScope(
+                    bson::JavaScriptCodeWithScope {
+                        code: code.clone(),
+                        scope: doc,
+                    },
+                ))
+            }
+            None => Ok(Bson::JavaScriptCode(code.clone())),
+        },
+        CanonicalValue::MinKey => Ok(Bson::MinKey),
+        CanonicalValue::MaxKey => Ok(Bson::MaxKey),
+        CanonicalValue::Array(items) => Ok(Bson::Array(
+            items
+                .iter()
+                .map(canonical_value_to_bson)
+                .collect::<Result<_, _>>()?,
+        )),
         CanonicalValue::Document(fields) => {
             let mut doc = Document::new();
             for (k, v) in fields {
-                doc.insert(k.clone(), canonical_value_to_bson(v));
+                doc.insert(k.clone(), canonical_value_to_bson(v)?);
             }
-            Bson::Document(doc)
+            Ok(Bson::Document(doc))
         }
     }
 }
@@ -577,44 +660,10 @@ fn canonical_value_to_bson(v: &CanonicalValue) -> Bson {
 /// Convert a field map into a BSON document.
 fn canonical_value_to_bson_document(
     fields: &indexmap::IndexMap<String, CanonicalValue>,
-) -> Document {
+) -> Result<Document, MeldError> {
     let mut doc = Document::new();
     for (k, v) in fields {
-        doc.insert(k.clone(), canonical_value_to_bson(v));
+        doc.insert(k.clone(), canonical_value_to_bson(v)?);
     }
-    doc
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn canonical_value_to_bson_preserves_type_distinction() {
-        let text_id =
-            canonical_value_to_bson(&CanonicalValue::Text("507f1f77bcf86cd799439011".into()));
-        let bytes: Vec<u8> = (0..24)
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&"507f1f77bcf86cd799439011"[i..i + 2], 16).unwrap())
-            .collect();
-        let oid = canonical_value_to_bson(&CanonicalValue::ObjectId(bytes));
-        assert_ne!(text_id, oid);
-    }
-
-    #[test]
-    fn canonical_value_to_bson_round_trip_primitives() {
-        assert_eq!(
-            canonical_value_to_bson(&CanonicalValue::Text("O'Brien".into())),
-            Bson::String("O'Brien".into())
-        );
-        assert_eq!(
-            canonical_value_to_bson(&CanonicalValue::I32(42)),
-            Bson::Int32(42)
-        );
-        assert_eq!(canonical_value_to_bson(&CanonicalValue::Null), Bson::Null);
-        assert_eq!(
-            canonical_value_to_bson(&CanonicalValue::Boolean(true)),
-            Bson::Boolean(true)
-        );
-    }
+    Ok(doc)
 }

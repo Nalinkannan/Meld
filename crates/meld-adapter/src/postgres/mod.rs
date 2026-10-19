@@ -1,3 +1,5 @@
+#![allow(clippy::explicit_auto_deref)]
+
 //! PostgreSQL adapter.
 //!
 //! Uses `sqlx` with the `postgres` feature and `native-tls`. Identifier names
@@ -16,6 +18,7 @@ use tracing::info;
 pub mod apply;
 pub mod extract;
 pub mod introspect;
+pub mod query;
 pub mod verify;
 
 /// PostgreSQL database adapter.
@@ -145,7 +148,20 @@ impl DatabaseAdapter for PostgresAdapter {
         &self,
         table: &meld_core::state::PgTable,
     ) -> Result<Vec<meld_core::state::PgRow>, MeldError> {
-        extract::extract_table_rows(self.pool()?, table, None).await
+        let mut tx = self
+            .pool()?
+            .begin()
+            .await
+            .map_err(|e| MeldError::Io(format!("begin extraction transaction: {e}")))?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| MeldError::Io(format!("set transaction isolation: {e}")))?;
+        let rows = extract::extract_table_rows(&mut *tx, table).await?;
+        tx.commit()
+            .await
+            .map_err(|e| MeldError::Io(format!("commit extraction transaction: {e}")))?;
+        Ok(rows)
     }
 
     async fn introspect(&self) -> Result<EngineState, MeldError> {
@@ -170,6 +186,13 @@ impl DatabaseAdapter for PostgresAdapter {
             .map_err(|e| MeldError::Io(format!("health check failed: {e}")))?;
         let _: i32 = row.try_get(0).unwrap_or(0);
         Ok(())
+    }
+
+    async fn execute_query(
+        &self,
+        request: crate::adapter::QueryRequest,
+    ) -> Result<crate::adapter::QueryResult, MeldError> {
+        query::execute_sql(self.pool()?, request).await
     }
 }
 
