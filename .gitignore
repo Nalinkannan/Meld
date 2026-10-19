@@ -4,5 +4,4 @@
 *.log
 .DS_Store
 .env.example
-.meld
-
+/.meld
