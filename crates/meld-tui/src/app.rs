@@ -9,6 +9,7 @@
 //! runtime and the result is posted back as an `AppEvent::BackgroundResult`.
 
 use std::io;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use std::thread;
 
@@ -19,9 +20,11 @@ use crate::screens::{Screen, ScreenAction, ScreenContext, ScreenResult, ScreenTy
 use crate::terminal::{TerminalGuard, install_panic_hook};
 use crate::theme::Styles;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, KeyEventKind};
-use meld_adapter::{ConnectionConfig, MongoConfig, PostgresConfig};
+use meld_adapter::{ConnectionConfig, DatabaseAdapter, MongoConfig, PostgresConfig, QueryRequest};
 use meld_adapter::registry::AdapterRegistry;
+use meld_core::ids::{CommitHash, Hash};
 use meld_core::state::EngineKind;
+use meld_engine::{checkout, diff_cmd, drift, snapshot, verify_cmd};
 use meld_store::connection_store;
 use ratatui::{
     Terminal,
@@ -48,6 +51,13 @@ const MIN_HEIGHT: u16 = 24;
 
 /// Result of a background task posted back to the event loop.
 type BackgroundResult = Result<String, String>;
+
+/// Result of taking session parts: store path, adapter, and connection config.
+type SessionParts = (
+    PathBuf,
+    Option<Box<dyn DatabaseAdapter>>,
+    Option<ConnectionConfig>,
+);
 
 /// Main application state.
 pub struct App {
@@ -195,6 +205,50 @@ impl App {
             });
         });
         id
+    }
+
+    /// Request an async background operation. Returns a request id used to
+    /// match the result when it is posted back.
+    pub fn request_background_async<F>(&mut self, label: impl Into<String>, fut: F) -> u64
+    where
+        F: std::future::Future<Output = BackgroundResult> + Send + 'static,
+    {
+        let id = {
+            self.next_request_id += 1;
+            self.next_request_id
+        };
+        self.pending.push((id, label.into()));
+        self.busy = true;
+        let tx = self
+            .event_tx
+            .clone()
+            .expect("event channel not initialized");
+        tokio::spawn(async move {
+            let result = fut.await;
+            let (ok, message) = match &result {
+                Ok(m) => (true, m.clone()),
+                Err(e) => (false, e.clone()),
+            };
+            let _ = tx.send(AppEvent::BackgroundResult {
+                id,
+                ok,
+                message,
+                kind: BackgroundKind::Other,
+            });
+        });
+        id
+    }
+
+    /// Synchronously takes the store path, adapter, and connection config out
+    /// of the session, releasing the `MutexGuard` before any async work. This
+    /// avoids holding a `std::sync::MutexGuard` across an `.await` point,
+    /// which is not `Send` when `Session: !Send`.
+    fn take_session_parts(ctx: &ScreenContext) -> io::Result<SessionParts> {
+        let mut session = ctx.session.lock().map_err(|e| io::Error::other(e.to_string()))?;
+        let path = session.store.path().to_path_buf();
+        let adapter = session.take_adapter();
+        let config = session.connection.clone();
+        Ok((path, adapter, config))
     }
 
     /// Record a status message.
@@ -368,7 +422,23 @@ impl App {
             }
             Snapshot(message) => {
                 debug!(message = %message, "apply_action: Snapshot");
-                self.set_status(format!("snapshot: {message}"))
+                let ctx = match self.ctx.clone() {
+                    Some(c) => c,
+                    None => {
+                        self.set_error("Session is not initialized.".to_string());
+                        return Ok(());
+                    }
+                };
+                let (store_path, adapter, config) = Self::take_session_parts(&ctx)?;
+                self.request_background_async(format!("snapshot: {message}"), async move {
+                    let mut session = meld_engine::Session::open(store_path).map_err(|e| e.to_string())?;
+                    if let Some(adapter) = adapter {
+                        let cfg = config.ok_or_else(|| "no connection config".to_string())?;
+                        session.install_adapter(adapter, cfg);
+                    }
+                    let result = snapshot::snapshot(&mut session, &message, "meld").await.map_err(|e| e.to_string())?;
+                    Ok(format!("committed {} (root {})", result.commit_hash.short(12), result.root_hash.short(12)))
+                });
             }
             History => {
                 debug!("apply_action: History");
@@ -376,31 +446,173 @@ impl App {
             }
             Diff(a, b) => {
                 debug!(a = %a, b = %b, "apply_action: Diff");
-                let _ = (a, b);
-                self.push_screen(ScreenType::Diff)
+                let from = CommitHash(Hash::from_hex(&a).map_err(|e| io::Error::other(e.to_string()))?);
+                let to = CommitHash(Hash::from_hex(&b).map_err(|e| io::Error::other(e.to_string()))?);
+                let ctx = match self.ctx.clone() {
+                    Some(c) => c,
+                    None => {
+                        self.set_error("Session is not initialized.".to_string());
+                        return Ok(());
+                    }
+                };
+                let store_path = {
+                    let session = ctx.session.lock().map_err(|e| io::Error::other(format!("session lock failed: {e}")))?;
+                    session.store.path().to_path_buf()
+                };
+                self.request_background_async(format!("diff {a} {b}"), async move {
+                    let session = meld_engine::Session::open(store_path).map_err(|e| e.to_string())?;
+                    let diff = diff_cmd::diff(&session.store, &from, &to).await.map_err(|e| e.to_string())?;
+                    Ok(format!("diff summary: {} changes", diff.summary.total_changes()))
+                });
+                self.push_screen(ScreenType::Diff);
             }
             Branches => {
                 debug!("apply_action: Branches");
                 self.push_screen(ScreenType::Branches)
             }
+            BranchCreate { name, target } => {
+                debug!(name = %name, ?target, "apply_action: BranchCreate");
+                let ctx = match self.ctx.clone() {
+                    Some(c) => c,
+                    None => {
+                        self.set_error("Session is not initialized.".to_string());
+                        return Ok(());
+                    }
+                };
+                let target = match target {
+                    Some(t) => Some(CommitHash(Hash::from_hex(&t).map_err(|e| io::Error::other(e.to_string()))?)),
+                    None => None,
+                };
+                let store_path = {
+                    let session = ctx.session.lock().map_err(|e| io::Error::other(format!("session lock failed: {e}")))?;
+                    session.store.path().to_path_buf()
+                };
+                self.request_background_async(format!("branch create {name}"), async move {
+                    let mut session = meld_engine::Session::open(store_path).map_err(|e| e.to_string())?;
+                    session.create_branch(&name, target).await.map_err(|e| e.to_string())?;
+                    Ok(format!("branch '{name}' created"))
+                });
+            }
+            BranchSwitch { name } => {
+                debug!(name = %name, "apply_action: BranchSwitch");
+                let ctx = match self.ctx.clone() {
+                    Some(c) => c,
+                    None => {
+                        self.set_error("Session is not initialized.".to_string());
+                        return Ok(());
+                    }
+                };
+                let store_path = {
+                    let session = ctx.session.lock().map_err(|e| io::Error::other(format!("session lock failed: {e}")))?;
+                    session.store.path().to_path_buf()
+                };
+                self.request_background_async(format!("branch switch {name}"), async move {
+                    let mut session = meld_engine::Session::open(store_path).map_err(|e| e.to_string())?;
+                    session.switch_branch(&name).await.map_err(|e| e.to_string())?;
+                    Ok(format!("switched to branch '{name}'"))
+                });
+            }
             Merge(source) => {
                 debug!(source = %source, "apply_action: Merge");
-                let _ = source;
                 self.push_screen(ScreenType::Merge)
             }
             Restore(commit) => {
                 debug!(commit = ?commit, "apply_action: Restore");
-                let _ = commit;
-                self.push_screen(ScreenType::Restore)
+                self.push_screen(ScreenType::Restore);
+                let ctx = match self.ctx.clone() {
+                    Some(c) => c,
+                    None => {
+                        self.set_error("Session is not initialized.".to_string());
+                        return Ok(());
+                    }
+                };
+                let (store_path, adapter, config) = Self::take_session_parts(&ctx)?;
+                self.request_background_async(format!("restore {commit}"), async move {
+                    let mut session = meld_engine::Session::open(store_path).map_err(|e| e.to_string())?;
+                    if let Some(adapter) = adapter {
+                        let cfg = config.ok_or_else(|| "no connection config".to_string())?;
+                        session.install_adapter(adapter, cfg);
+                    }
+                    checkout::checkout(&mut session, &commit).await.map_err(|e| e.to_string())?;
+                    Ok(format!("restored to {commit}"))
+                });
             }
-            Verify(commit) => {
-                debug!(commit = ?commit, "apply_action: Verify");
-                let _ = commit;
-                self.push_screen(ScreenType::Verify)
+            Verify(commit_opt) => {
+                debug!(commit = ?commit_opt, "apply_action: Verify");
+                let commit = match commit_opt {
+                    Some(c) => c,
+                    None => match self.ctx.as_ref()
+                        .and_then(|c| c.session.lock().ok())
+                        .and_then(|s| s.store.get_head().ok())
+                        .flatten()
+                    {
+                        Some(h) => h,
+                        None => {
+                            self.set_error("HEAD is empty".to_string());
+                            return Ok(());
+                        }
+                    },
+                };
+                let ctx = match self.ctx.clone() {
+                    Some(c) => c,
+                    None => {
+                        self.set_error("Session is not initialized.".to_string());
+                        return Ok(());
+                    }
+                };
+                let (store_path, adapter, config) = Self::take_session_parts(&ctx)?;
+                self.request_background_async(format!("verify {commit}"), async move {
+                    let mut session = meld_engine::Session::open(store_path).map_err(|e| e.to_string())?;
+                    if let Some(adapter) = adapter {
+                        let cfg = config.ok_or_else(|| "no connection config".to_string())?;
+                        session.install_adapter(adapter, cfg);
+                    }
+                    let adapter = session.adapter().map_err(|e| e.to_string())?;
+                    let report = verify_cmd::verify(adapter, &session.store, &commit).await.map_err(|e| e.to_string())?;
+                    if report.passed {
+                        Ok(format!("verify passed for {commit}"))
+                    } else {
+                        Err(format!("verify failed for {commit}: {:?}", report.mismatches))
+                    }
+                });
+                self.push_screen(ScreenType::Verify);
             }
             Drift => {
                 debug!("apply_action: Drift");
-                self.push_screen(ScreenType::Diff)
+                let ctx = match self.ctx.clone() {
+                    Some(c) => c,
+                    None => {
+                        self.set_error("Session is not initialized.".to_string());
+                        return Ok(());
+                    }
+                };
+                self.request_background_async("drift", async move {
+                    let (store_path, adapter, config) = Self::take_session_parts(&ctx).map_err(|e| e.to_string())?;
+                    let mut session = meld_engine::Session::open(store_path).map_err(|e| e.to_string())?;
+                    if let Some(adapter) = adapter {
+                        let cfg = config.ok_or_else(|| "no connection config".to_string())?;
+                        session.install_adapter(adapter, cfg);
+                    }
+                    let diff = drift::drift_head(&session).await.map_err(|e| e.to_string())?;
+                    Ok(format!("drift: {} changes", diff.summary.total_changes()))
+                });
+                self.push_screen(ScreenType::Diff);
+            }
+            Query { sql } => {
+                debug!(sql = %sql, "apply_action: Query");
+                let request = QueryRequest::PostgreSql { sql: sql.clone(), read_only: true };
+                let ctx = self.ctx.clone().ok_or_else(|| io::Error::other("no session"))?;
+                let (store_path, adapter, config) = Self::take_session_parts(&ctx)?;
+                self.request_background_async("query", async move {
+                    let mut session = meld_engine::Session::open(store_path).map_err(|e| e.to_string())?;
+                    if let Some(adapter) = adapter {
+                        let cfg = config.ok_or_else(|| "no connection config".to_string())?;
+                        session.install_adapter(adapter, cfg);
+                    }
+                    let result = session.execute_query(request).await.map_err(|e| e.to_string())?;
+                    Ok(format!("query returned {} rows in {}ms", result.row_count, result.duration_ms))
+                });
+                self.push_screen(ScreenType::Diff);
             }
         }
         Ok(())
@@ -1210,37 +1422,33 @@ impl App {
 
     fn dispatch_command(&mut self, cmd: crate::command::MeldCommand) -> ScreenResult {
         use crate::command::MeldCommand::*;
-        match cmd {
+        let action = match cmd {
             Help => {
                 self.push_screen(ScreenType::Help);
+                return Ok(());
             }
-            Connect { profile } => self.connect_profile(profile)?,
-            Disconnect => self.apply_action(ScreenAction::Disconnect)?,
-            Snapshot { message } => {
-                self.set_status(format!("snapshot: {message}"));
-            }
-            History => self.push_screen(ScreenType::History),
-            Diff { a, b } => {
-                let _ = (a, b);
-                self.push_screen(ScreenType::Diff);
-            }
-            Branches => self.push_screen(ScreenType::Branches),
-            Merge { source } => {
-                let _ = source;
-                self.push_screen(ScreenType::Merge);
-            }
-            Restore { commit } => {
-                let _ = commit;
-                self.push_screen(ScreenType::Restore);
-            }
-            Verify { commit } => {
-                let _ = commit;
-                self.push_screen(ScreenType::Verify);
-            }
-            Drift => self.push_screen(ScreenType::Diff),
-            Query => self.push_screen(ScreenType::Diff),
-        }
-        Ok(())
+            Connect { profile } => return self.connect_profile(profile),
+            Disconnect => ScreenAction::Disconnect,
+            Snapshot { message } => ScreenAction::Snapshot(message),
+            History => ScreenAction::History,
+            Diff { a, b } => ScreenAction::Diff(a, b),
+            Branches => ScreenAction::Branches,
+            BranchCreate { name, target } => ScreenAction::BranchCreate { name, target },
+            BranchSwitch { name } => ScreenAction::BranchSwitch { name },
+            Merge { source } => ScreenAction::Merge(source),
+            Restore { commit } => ScreenAction::Restore(CommitHash(
+                Hash::from_hex(&commit).map_err(|e| io::Error::other(e.to_string()))?,
+            )),
+            Verify { commit } => match commit {
+                Some(c) => ScreenAction::Verify(Some(CommitHash(
+                    Hash::from_hex(&c).map_err(|e| io::Error::other(e.to_string()))?,
+                ))),
+                None => ScreenAction::Verify(None),
+            },
+            Drift => ScreenAction::Drift,
+            Query { sql } => ScreenAction::Query { sql },
+        };
+        self.apply_action(action)
     }
 }
 

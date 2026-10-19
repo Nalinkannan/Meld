@@ -46,9 +46,12 @@ pub enum ScreenAction {
     Diff(String, String),
     Branches,
     Merge(String),
+    BranchCreate { name: String, target: Option<String> },
+    BranchSwitch { name: String },
     Restore(CommitHash),
     Verify(Option<CommitHash>),
     Drift,
+    Query { sql: String },
 }
 
 pub type ScreenResult = Result<(), std::io::Error>;

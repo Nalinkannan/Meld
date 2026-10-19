@@ -15,11 +15,14 @@ pub enum MeldCommand {
     History,
     Diff { a: String, b: String },
     Branches,
+    BranchCreate { name: String, target: Option<String> },
+    BranchSwitch { name: String },
     Merge { source: String },
     Restore { commit: String },
+    
     Verify { commit: Option<String> },
     Drift,
-    Query,
+    Query { sql: String },
 }
 
 /// Parse a command line (without the leading `:`).
@@ -85,6 +88,32 @@ pub fn parse_command(input: &str) -> Result<MeldCommand, String> {
             }
             Ok(MeldCommand::Branches)
         }
+        "branch" => {
+            let sub = rest
+                .first()
+                .ok_or_else(|| "branch requires a subcommand: branch create|switch".to_string())?;
+            match *sub {
+                "create" => {
+                    let name = rest
+                        .get(1)
+                        .ok_or_else(|| "branch create requires a name: branch create <name> [target]".to_string())?;
+                    let target = rest.get(2).map(|t| t.to_string());
+                    Ok(MeldCommand::BranchCreate {
+                        name: name.to_string(),
+                        target,
+                    })
+                }
+                "switch" => {
+                    let name = rest
+                        .get(1)
+                        .ok_or_else(|| "branch switch requires a name: branch switch <name>".to_string())?;
+                    Ok(MeldCommand::BranchSwitch {
+                        name: name.to_string(),
+                    })
+                }
+                other => Err(format!("unknown branch subcommand: {other}")),
+            }
+        }
         "merge" | "m" => {
             let source = rest
                 .first()
@@ -116,10 +145,11 @@ pub fn parse_command(input: &str) -> Result<MeldCommand, String> {
             Ok(MeldCommand::Drift)
         }
         "query" => {
-            if !rest.is_empty() {
-                return Err(format!("unknown argument to query: {}", rest[0]));
+            let sql = rest.join(" ");
+            if sql.is_empty() {
+                return Err("query requires a statement: query <sql>".to_string());
             }
-            Ok(MeldCommand::Query)
+            Ok(MeldCommand::Query { sql })
         }
         _ => {
             let suggestions = suggest(cmd);
@@ -141,11 +171,10 @@ pub fn complete_command(input: &str) -> Option<String> {
     if input.is_empty() {
         return None;
     }
-    let mut parts = input.splitn(2, char::is_whitespace);
-    let head = parts.next().unwrap_or("");
-    let tail = parts.next().unwrap_or("");
 
     let commands = [
+        "branch create",
+        "branch switch",
         "branches",
         "connect",
         "disconnect",
@@ -159,20 +188,26 @@ pub fn complete_command(input: &str) -> Option<String> {
         "snapshot",
         "verify",
     ];
+
+    // Match commands where every whitespace-separated token of `input` is a
+    // prefix of the corresponding token of the command.
+    let input_tokens: Vec<&str> = input.split_whitespace().collect();
     let matches: Vec<&str> = commands
         .iter()
-        .filter(|c| c.starts_with(head))
+        .filter(|c| {
+            let cmd_tokens: Vec<&str> = c.split_whitespace().collect();
+            if cmd_tokens.len() < input_tokens.len() {
+                return false;
+            }
+            input_tokens
+                .iter()
+                .zip(cmd_tokens.iter())
+                .all(|(a, b)| b.starts_with(a))
+        })
         .copied()
         .collect();
     match matches.len() {
-        1 => {
-            let completed = if tail.is_empty() {
-                matches[0].to_string() + " "
-            } else {
-                matches[0].to_string() + " " + tail
-            };
-            Some(completed)
-        }
+        1 => Some(matches[0].to_string() + " "),
         _ => None,
     }
 }
@@ -180,6 +215,8 @@ pub fn complete_command(input: &str) -> Option<String> {
 /// Suggest similar command names for an unknown command.
 fn suggest(cmd: &str) -> Vec<String> {
     let commands = [
+        "branch create",
+        "branch switch",
         "branches",
         "connect",
         "disconnect",
@@ -266,6 +303,30 @@ mod tests {
     }
 
     #[test]
+    fn parse_branch_commands() {
+        assert!(matches!(
+            parse_command("branch create main"),
+            Ok(MeldCommand::BranchCreate { name, target }) if name == "main" && target.is_none()
+        ));
+        assert!(matches!(
+            parse_command("branch create feature abc123"),
+            Ok(MeldCommand::BranchCreate { name, target }) if name == "feature" && target == Some("abc123".to_string())
+        ));
+        assert!(matches!(
+            parse_command("branch switch main"),
+            Ok(MeldCommand::BranchSwitch { name }) if name == "main"
+        ));
+    }
+
+    #[test]
+    fn parse_query_command() {
+        assert!(matches!(
+            parse_command("query select 1"),
+            Ok(MeldCommand::Query { sql }) if sql == "select 1"
+        ));
+    }
+
+    #[test]
     fn parse_unknown_command_suggests() {
         let err = parse_command("connet main").unwrap_err();
         assert!(err.contains("connect"));
@@ -276,5 +337,6 @@ mod tests {
         assert_eq!(complete_command("con"), Some("connect ".to_string()));
         // "h" is ambiguous between help and history; use an unambiguous prefix.
         assert_eq!(complete_command("his"), Some("history ".to_string()));
+        assert_eq!(complete_command("bra c"), Some("branch create ".to_string()));
     }
 }
